@@ -59,7 +59,7 @@ func counter(t testing.TB, reader *sdkmetric.ManualReader, name string) int64 {
 	return total
 }
 
-func runTraces(t testing.TB, cfg *Config, td ptrace.Traces) (ptrace.Traces, error, *sdkmetric.ManualReader) {
+func runTraces(t testing.TB, cfg *Config, td ptrace.Traces) (ptrace.Traces, *sdkmetric.ManualReader, error) {
 	t.Helper()
 	require.NoError(t, cfg.Validate())
 	set, reader := settings(t)
@@ -69,10 +69,10 @@ func runTraces(t testing.TB, cfg *Config, td ptrace.Traces) (ptrace.Traces, erro
 	require.NoError(t, p.Start(context.Background(), componenttest.NewNopHost()))
 	defer func() { require.NoError(t, p.Shutdown(context.Background())) }()
 	if err := p.ConsumeTraces(context.Background(), td); err != nil {
-		return ptrace.Traces{}, err, reader
+		return ptrace.Traces{}, reader, err
 	}
 	require.Len(t, sink.AllTraces(), 1)
-	return sink.AllTraces()[0], nil, reader
+	return sink.AllTraces()[0], reader, nil
 }
 
 func runLogs(t testing.TB, cfg *Config, ld plog.Logs) plog.Logs {
@@ -141,7 +141,7 @@ func TestTracesRoundTrip(t *testing.T) {
 	want := ptrace.NewTraces()
 	in.CopyTo(want)
 
-	out, err, reader := runTraces(t, cfg, in)
+	out, reader, err := runTraces(t, cfg, in)
 	require.NoError(t, err)
 
 	span := out.ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0)
@@ -199,7 +199,7 @@ func TestSegregationOfDuties(t *testing.T) {
 		RuleConfig{Name: "tools", Recipients: []string{pubPEM(technical), pubPEM(escrow)},
 			AttributePatterns: []string{`^gen_ai\.tool\.`}},
 	)
-	out, err, _ := runTraces(t, cfg, genAITraces())
+	out, _, err := runTraces(t, cfg, genAITraces())
 	require.NoError(t, err)
 
 	attrs := out.ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0).Attributes()
@@ -233,11 +233,11 @@ func TestSegregationOfDuties(t *testing.T) {
 func TestIdempotent(t *testing.T) {
 	key := newKey(t, fastSuite)
 	cfg := config(RuleConfig{Recipients: []string{pubPEM(key)}, Presets: []string{"gen_ai"}})
-	once, err, _ := runTraces(t, cfg, genAITraces())
+	once, _, err := runTraces(t, cfg, genAITraces())
 	require.NoError(t, err)
 	snapshot := once.ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0).Attributes().AsRaw()
 
-	twice, err, reader := runTraces(t, cfg, once)
+	twice, reader, err := runTraces(t, cfg, once)
 	require.NoError(t, err)
 	require.Equal(t, snapshot, twice.ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0).Attributes().AsRaw())
 	require.Zero(t, counter(t, reader, "otelcol_processor_encryption_values_encrypted"))
@@ -259,7 +259,7 @@ func TestOnError(t *testing.T) {
 	rule := RuleConfig{Recipients: []string{pubPEM(key)}, AttributePatterns: []string{`^secret\.`}}
 
 	cfg := config(rule)
-	out, err, reader := runTraces(t, cfg, td())
+	out, reader, err := runTraces(t, cfg, td())
 	require.NoError(t, err)
 	attrs := out.ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0).Attributes()
 	_, ok := attrs.Get("secret.score")
@@ -270,7 +270,7 @@ func TestOnError(t *testing.T) {
 
 	cfg = config(rule)
 	cfg.OnError = OnErrorReject
-	_, err, _ = runTraces(t, cfg, td())
+	_, _, err = runTraces(t, cfg, td())
 	require.ErrorContains(t, err, "secret.score")
 }
 

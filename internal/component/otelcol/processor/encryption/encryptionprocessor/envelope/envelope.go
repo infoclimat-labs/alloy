@@ -16,7 +16,6 @@ import (
 	"io"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -123,8 +122,27 @@ type DEK struct {
 	wrapped string
 	aead    cipher.AEAD
 	created time.Time
-	uses    atomic.Uint64
+	uses    counter
 	rand    io.Reader
+}
+
+// counter is a concurrency-safe counter. The package deliberately depends on
+// the standard library only, hence a mutex rather than an atomics library.
+type counter struct {
+	mu sync.Mutex
+	n  uint64
+}
+
+func (c *counter) Add(delta uint64) {
+	c.mu.Lock()
+	c.n += delta
+	c.mu.Unlock()
+}
+
+func (c *counter) Load() uint64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.n
 }
 
 func newDEKCipher(key []byte) (cipher.AEAD, error) {
@@ -269,7 +287,7 @@ type Sealer struct {
 
 	mu        sync.Mutex
 	current   *DEK
-	rotations atomic.Uint64
+	rotations counter
 }
 
 // NewSealer creates a sealer wrapping each DEK for all recipients.

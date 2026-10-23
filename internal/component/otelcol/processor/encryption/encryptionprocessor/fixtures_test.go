@@ -51,7 +51,7 @@ func TestPythonSDKFixtures(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, 4, td.SpanCount())
 
-		out, err, _ := runTraces(t, cfg, td)
+		out, _, err := runTraces(t, cfg, td)
 		require.NoError(t, err)
 		js, err := (&ptrace.JSONMarshaler{}).MarshalTraces(out)
 		require.NoError(t, err)

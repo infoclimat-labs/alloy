@@ -30,7 +30,7 @@ import (
 
 func main() {
 	if err := run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr); err != nil {
-		fmt.Fprintln(os.Stderr, "otelcrypt:", err)
+		_, _ = fmt.Fprintln(os.Stderr, "otelcrypt:", err)
 		var ee exitError
 		if errors.As(err, &ee) {
 			os.Exit(int(ee))
@@ -56,7 +56,7 @@ Run "otelcrypt <command> -h" for the flags of a command.
 
 func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
-		fmt.Fprint(stderr, usage)
+		_, _ = fmt.Fprint(stderr, usage)
 		return exitError(2)
 	}
 	switch args[0] {
@@ -69,10 +69,10 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	case "decrypt":
 		return decryptCmd(args[1:], stdin, stdout, stderr)
 	case "-h", "--help", "help":
-		fmt.Fprint(stdout, usage)
+		_, _ = fmt.Fprint(stdout, usage)
 		return nil
 	default:
-		fmt.Fprint(stderr, usage)
+		_, _ = fmt.Fprint(stderr, usage)
 		return fmt.Errorf("unknown command %q", args[0])
 	}
 }
@@ -120,7 +120,7 @@ func keygen(args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(stderr, "generated %s key %s\n", suite, k.KeyID())
+	_, _ = fmt.Fprintf(stderr, "generated %s key %s\n", suite, k.KeyID())
 	return nil
 }
 
@@ -277,9 +277,9 @@ func decryptCmd(args []string, stdin io.Reader, stdout, stderr io.Writer) error 
 		return err
 	}
 
-	fmt.Fprintf(stderr, "decrypted %d value(s), %d failure(s) [%s]\n", rep.Decrypted, rep.Failed, rep.Format)
+	_, _ = fmt.Fprintf(stderr, "decrypted %d value(s), %d failure(s) [%s]\n", rep.Decrypted, rep.Failed, rep.Format)
 	for _, e := range rep.Errors {
-		fmt.Fprintln(stderr, "  -", e)
+		_, _ = fmt.Fprintln(stderr, "  -", e)
 	}
 	if rep.Failed > 0 {
 		return exitError(3)

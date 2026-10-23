@@ -53,7 +53,7 @@ func TestKeygenAndDecrypt(t *testing.T) {
 	s, _ := envelope.NewSealer([]*envelope.PublicKey{pk}, envelope.SealerOptions{})
 	dek, _ := s.Current()
 	tid, sid := bytes.Repeat([]byte{7}, 16), bytes.Repeat([]byte{8}, 8)
-	tok, _ := dek.Seal(envelope.EncodeString("prompt confidentiel"), envelope.Context{
+	tok, _ := dek.Seal(envelope.EncodeString("secret prompt"), envelope.Context{
 		Signal: "traces", Scope: "span", Key: "gen_ai.input.messages", TraceID: tid, SpanID: sid,
 	})
 	doc, _ := json.Marshal(map[string]any{"resourceSpans": []any{map[string]any{"scopeSpans": []any{map[string]any{"spans": []any{map[string]any{
@@ -79,7 +79,7 @@ func TestKeygenAndDecrypt(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decrypt: %v\n%s", err, stderr)
 	}
-	if !strings.Contains(out, "prompt confidentiel") || strings.Contains(out, envelope.TokenPrefix) {
+	if !strings.Contains(out, "secret prompt") || strings.Contains(out, envelope.TokenPrefix) {
 		t.Fatalf("output not decrypted:\n%s", out)
 	}
 	line, _ := os.ReadFile(audit)
