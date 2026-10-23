@@ -65,6 +65,7 @@ docker compose down -v
 | `decrypt.sh`               | Control authority workflow: fetch, inspect, decrypt, audit.       |
 | `Dockerfile`               | Builds the forked Alloy and the `otelcrypt` tool.                 |
 | `compose.yaml`             | Alloy, Tempo, Loki, Grafana, key generation, generator, toolbox.  |
+| `kubernetes/`              | Helm values and guide to run the published image in a cluster.    |
 
 The demo generates keys in Docker volumes for convenience. Alloy only mounts
 the recipients' public keys and its own signing key; the recipients' private

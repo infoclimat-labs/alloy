@@ -216,3 +216,56 @@ jobs:
       - name: Tear down
         if: always()
         run: docker compose down -v
+
+  publish:
+    name: Publish images to GHCR
+    needs: [test, e2e]
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+    env:
+      ALLOY_IMAGE: ghcr.io/${{ github.repository_owner }}/alloy
+      OTELCRYPT_IMAGE: ghcr.io/${{ github.repository_owner }}/otelcrypt
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-qemu-action@06116385d9baf250c9f4dcb4858b16962ea869c3 # v4.1.0
+
+      - uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      # The repository Dockerfile: same image as the official one (web UI,
+      # non-root user available, /bin/alloy entrypoint), with this fork's code.
+      - name: Build and push Alloy
+        run: |
+          set -o pipefail
+          short=$(git rev-parse --short HEAD)
+          docker buildx build --push --platform linux/amd64,linux/arm64 \
+            --build-arg VERSION="v0.0.0-encryption-poc-$short" --build-arg RELEASE_BUILD=0 \
+            -t "$ALLOY_IMAGE:encryption-poc" -t "$ALLOY_IMAGE:encryption-poc-$short" \
+            -f Dockerfile . 2>&1 | tail -40
+
+      - name: Build and push otelcrypt
+        run: |
+          set -o pipefail
+          short=$(git rev-parse --short HEAD)
+          docker buildx build --push --platform linux/amd64,linux/arm64 --target otelcrypt \
+            -t "$OTELCRYPT_IMAGE:encryption-poc" -t "$OTELCRYPT_IMAGE:encryption-poc-$short" \
+            -f example/encryption/Dockerfile . 2>&1 | tail -20
+
+      - name: Report
+        if: always()
+        run: |
+          short=$(git rev-parse --short HEAD)
+          if [ "${{ job.status }}" = "success" ]; then
+            echo "::notice title=publish: passed::$ALLOY_IMAGE:encryption-poc-$short and $OTELCRYPT_IMAGE:encryption-poc-$short pushed"
+          else
+            echo "::error title=publish: failed::see the job logs"
+          fi
