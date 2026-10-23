@@ -66,6 +66,7 @@ type encryptor struct {
 	onError     OnError
 	acceptInput bool
 	signer      *envelope.SigningKey
+	upstream    *envelope.Verifier
 
 	rules []*rule
 
@@ -92,6 +93,12 @@ func newEncryptor(cfg *Config, logger *zap.Logger, meter metric.Meter) (*encrypt
 	var err error
 	if e.signer, err = cfg.signingKey(); err != nil {
 		return nil, fmt.Errorf("signing_key: %w", err)
+	}
+	if e.upstream, err = cfg.upstreamVerifier(); err != nil {
+		return nil, fmt.Errorf("upstream_verify_keys: %w", err)
+	}
+	if e.acceptInput && e.upstream.Len() == 0 {
+		return nil, errors.New("accept_encrypted_input requires upstream_verify_keys")
 	}
 
 	opts := envelope.SealerOptions{MaxUses: cfg.KeyRotation.MaxValues, MaxAge: cfg.KeyRotation.MaxAge}
@@ -195,49 +202,105 @@ type record struct {
 	e      *encryptor
 	signal string
 	// attrs are the attributes of the span or log record, where the record
-	// ID, wrapped keys and signature are stored.
+	// ID, wrapped keys, metadata digest and signature are stored.
 	attrs   pcommon.Map
+	meta    func() envelope.RecordMeta
 	rid     []byte
 	traceID []byte
 	spanID  []byte
 	deks    map[*rule]*envelope.DEK
 	// wrapped holds every wrapped key referenced by the record, including
-	// accepted upstream ones.
+	// those of a trusted upstream tier.
 	wrapped map[string]string
 	entries []envelope.Entry
+	// trusted is true when the record carries a valid upstream signature,
+	// in which case its encrypted values are kept.
+	trusted bool
 }
 
-func (e *encryptor) newRecord(signal string, attrs pcommon.Map, traceID, spanID []byte) *record {
-	rec := &record{e: e, signal: signal, attrs: attrs, traceID: traceID, spanID: spanID}
-	if !e.acceptInput {
-		// Never trust encryption metadata coming from clients.
-		attrs.RemoveIf(func(k string, _ pcommon.Value) bool { return strings.HasPrefix(k, envelope.AttrPrefix) })
-		return rec
+func (e *encryptor) newRecord(signal string, attrs pcommon.Map, traceID, spanID []byte, meta func() envelope.RecordMeta, in func() []envelope.Entry) *record {
+	rec := &record{e: e, signal: signal, attrs: attrs, traceID: traceID, spanID: spanID, meta: meta}
+	if e.acceptInput {
+		rec.trusted = rec.verifyUpstream(in())
 	}
-	if v, ok := attrs.Get(envelope.RecordIDAttr); ok && v.Type() == pcommon.ValueTypeStr {
-		if rid, err := hex.DecodeString(v.Str()); err == nil && len(rid) == recordIDSize {
-			rec.rid = rid
-		}
+	if !rec.trusted {
+		// Never trust encryption metadata that isn't vouched for by a
+		// pinned upstream signature.
+		attrs.RemoveIf(func(k string, _ pcommon.Value) bool { return envelope.IsMetaKey(k) })
+		rec.wrapped = nil
+		rec.rid = nil
 	}
-	attrs.Range(func(k string, v pcommon.Value) bool {
-		if id, ok := strings.CutPrefix(k, envelope.WrappedKeyAttrPrefix); ok && v.Type() == pcommon.ValueTypeStr {
-			if rec.wrapped == nil {
-				rec.wrapped = map[string]string{}
-			}
-			rec.wrapped[id] = v.Str()
-		}
-		return true
-	})
-	attrs.Remove(envelope.SignatureAttr)
 	return rec
 }
 
-func (rec *record) context(scope, position, key string) (envelope.Context, error) {
+// verifyUpstream checks the signature of an incoming record before any
+// modification, and loads its record ID and wrapped keys when it is valid.
+func (rec *record) verifyUpstream(entries []envelope.Entry) bool {
+	get := func(k string) string {
+		if v, ok := rec.attrs.Get(k); ok && v.Type() == pcommon.ValueTypeStr {
+			return v.Str()
+		}
+		return ""
+	}
+	sig := get(envelope.SignatureAttr)
+	if sig == "" {
+		return false
+	}
+	rid, err := hex.DecodeString(get(envelope.RecordIDAttr))
+	if err != nil || len(rid) != recordIDSize {
+		return false
+	}
+	metaDigest := envelope.MetaDigest(rec.meta())
+	if hex.EncodeToString(metaDigest) != get(envelope.MetaAttr) {
+		return false
+	}
+	wrapped := map[string]string{}
+	rec.attrs.Range(func(k string, v pcommon.Value) bool {
+		if id, ok := strings.CutPrefix(k, envelope.WrappedKeyAttrPrefix); ok && v.Type() == pcommon.ValueTypeStr {
+			wrapped[id] = v.Str()
+		}
+		return true
+	})
+	used := map[string]string{}
+	for _, en := range entries {
+		id, _, err := envelope.ParseToken(en.Token)
+		if err != nil {
+			return false
+		}
+		w, ok := wrapped[id]
+		if !ok {
+			return false
+		}
+		used[id] = w
+	}
+	if _, err := rec.e.upstream.Verify(envelope.Manifest{
+		Signal:      rec.signal,
+		RecordID:    rid,
+		TraceID:     rec.traceID,
+		SpanID:      rec.spanID,
+		Entries:     entries,
+		WrappedKeys: used,
+		Meta:        metaDigest,
+	}, sig); err != nil {
+		return false
+	}
+	rec.rid, rec.wrapped = rid, used
+	return true
+}
+
+func (rec *record) ensureRID() error {
 	if rec.rid == nil {
 		rec.rid = make([]byte, recordIDSize)
 		if _, err := rand.Read(rec.rid); err != nil {
-			return envelope.Context{}, err
+			return err
 		}
+	}
+	return nil
+}
+
+func (rec *record) context(scope, position, key string) (envelope.Context, error) {
+	if err := rec.ensureRID(); err != nil {
+		return envelope.Context{}, err
 	}
 	return envelope.Context{
 		Signal:   rec.signal,
@@ -269,9 +332,10 @@ func (rec *record) dek(r *rule) (*envelope.DEK, error) {
 	return d, nil
 }
 
-// accepted reports whether an incoming value is a token to keep as is.
+// accepted reports whether an incoming value is a token of a trusted
+// upstream record, to keep as is.
 func (rec *record) accepted(v pcommon.Value) bool {
-	if !rec.e.acceptInput || v.Type() != pcommon.ValueTypeStr {
+	if !rec.trusted || v.Type() != pcommon.ValueTypeStr {
 		return false
 	}
 	id, _, err := envelope.ParseToken(v.Str())
@@ -344,12 +408,17 @@ func (e *encryptor) fail(ctx context.Context, r *rule, scope, key string, err er
 	return nil
 }
 
-// processAttributes encrypts the matching attributes of attrs.
+// processAttributes encrypts the matching attributes of attrs. Processor
+// metadata keys are only legitimate on the record itself: they are removed
+// from events and links.
 func (rec *record) processAttributes(ctx context.Context, attrs pcommon.Map, scope, position string) error {
+	if scope == scopeSpanEvent || scope == scopeSpanLink {
+		attrs.RemoveIf(func(k string, _ pcommon.Value) bool { return envelope.IsMetaKey(k) })
+	}
 	var failed []string
 	var rejectErr error
 	attrs.Range(func(k string, v pcommon.Value) bool {
-		if strings.HasPrefix(k, envelope.AttrPrefix) {
+		if envelope.IsMetaKey(k) {
 			return true
 		}
 		r := rec.e.match(k)
@@ -373,10 +442,16 @@ func (rec *record) processAttributes(ctx context.Context, attrs pcommon.Map, sco
 	return nil
 }
 
-// finish attaches the record ID, wrapped keys and signature.
+// finish attaches the record ID, wrapped keys, metadata digest and
+// signature. With a signing key, every record is signed, including records
+// without encrypted values, so that stripping encryption from a record is
+// detectable.
 func (rec *record) finish(ctx context.Context) error {
-	if len(rec.entries) == 0 {
+	if len(rec.entries) == 0 && rec.e.signer == nil {
 		return nil
+	}
+	if err := rec.ensureRID(); err != nil {
+		return err
 	}
 	rec.attrs.PutStr(envelope.RecordIDAttr, hex.EncodeToString(rec.rid))
 	used := map[string]string{}
@@ -389,12 +464,17 @@ func (rec *record) finish(ctx context.Context) error {
 			used[id] = w
 		}
 	}
+	rec.attrs.RemoveIf(func(k string, _ pcommon.Value) bool {
+		return strings.HasPrefix(k, envelope.WrappedKeyAttrPrefix) || k == envelope.SignatureAttr || k == envelope.MetaAttr
+	})
 	for id, w := range used {
 		rec.attrs.PutStr(envelope.WrappedKeyAttrPrefix+id, w)
 	}
 	if rec.e.signer == nil {
 		return nil
 	}
+	metaDigest := envelope.MetaDigest(rec.meta())
+	rec.attrs.PutStr(envelope.MetaAttr, hex.EncodeToString(metaDigest))
 	sig, err := rec.e.signer.Sign(envelope.Manifest{
 		Signal:      rec.signal,
 		RecordID:    rec.rid,
@@ -402,6 +482,7 @@ func (rec *record) finish(ctx context.Context) error {
 		SpanID:      rec.spanID,
 		Entries:     rec.entries,
 		WrappedKeys: used,
+		Meta:        metaDigest,
 	})
 	if err != nil {
 		return fmt.Errorf("signing record: %w", err)
@@ -439,9 +520,71 @@ func position(i int, name string) string {
 	return strconv.Itoa(i) + "/" + name
 }
 
+// metaKeys appends the attribute keys of a map to keys, as expected by
+// envelope.RecordMeta.
+func metaKeys(keys []string, attrs pcommon.Map, scope, position string) []string {
+	attrs.Range(func(k string, _ pcommon.Value) bool {
+		if !envelope.IsMetaKey(k) {
+			keys = append(keys, envelope.MetaKey(scope, position, k))
+		}
+		return true
+	})
+	return keys
+}
+
+// tokenEntries appends the tokens of a map to entries.
+func tokenEntries(entries []envelope.Entry, attrs pcommon.Map, scope, position string) []envelope.Entry {
+	attrs.Range(func(k string, v pcommon.Value) bool {
+		if !envelope.IsMetaKey(k) && v.Type() == pcommon.ValueTypeStr && envelope.IsToken(v.Str()) {
+			entries = append(entries, envelope.Entry{Scope: scope, Position: position, Key: k, Token: v.Str()})
+		}
+		return true
+	})
+	return entries
+}
+
+func spanMeta(span ptrace.Span) envelope.RecordMeta {
+	m := envelope.RecordMeta{
+		Name:  span.Name(),
+		Start: uint64(span.StartTimestamp()),
+		End:   uint64(span.EndTimestamp()),
+	}
+	m.Keys = metaKeys(m.Keys, span.Attributes(), scopeSpan, "")
+	events := span.Events()
+	for i := 0; i < events.Len(); i++ {
+		ev := events.At(i)
+		pos := position(i, ev.Name())
+		m.Events = append(m.Events, pos+"@"+strconv.FormatUint(uint64(ev.Timestamp()), 10))
+		m.Keys = metaKeys(m.Keys, ev.Attributes(), scopeSpanEvent, pos)
+	}
+	links := span.Links()
+	for i := 0; i < links.Len(); i++ {
+		link := links.At(i)
+		m.Keys = metaKeys(m.Keys, link.Attributes(), scopeSpanLink, position(i, link.SpanID().String()))
+	}
+	return m
+}
+
+func spanTokens(span ptrace.Span) []envelope.Entry {
+	entries := tokenEntries(nil, span.Attributes(), scopeSpan, "")
+	events := span.Events()
+	for i := 0; i < events.Len(); i++ {
+		ev := events.At(i)
+		entries = tokenEntries(entries, ev.Attributes(), scopeSpanEvent, position(i, ev.Name()))
+	}
+	links := span.Links()
+	for i := 0; i < links.Len(); i++ {
+		link := links.At(i)
+		entries = tokenEntries(entries, link.Attributes(), scopeSpanLink, position(i, link.SpanID().String()))
+	}
+	return entries
+}
+
 func (e *encryptor) processSpan(ctx context.Context, span ptrace.Span) error {
 	traceID, spanID := span.TraceID(), span.SpanID()
-	rec := e.newRecord(signalTraces, span.Attributes(), idBytes(traceID, traceID[:]), idBytes(spanID, spanID[:]))
+	rec := e.newRecord(signalTraces, span.Attributes(), idBytes(traceID, traceID[:]), idBytes(spanID, spanID[:]),
+		func() envelope.RecordMeta { return spanMeta(span) },
+		func() []envelope.Entry { return spanTokens(span) })
 	if err := rec.processAttributes(ctx, span.Attributes(), scopeSpan, ""); err != nil {
 		return err
 	}
@@ -493,29 +636,68 @@ func eventName(lr plog.LogRecord) (string, bool) {
 	return "", true
 }
 
+func logMeta(lr plog.LogRecord) envelope.RecordMeta {
+	return envelope.RecordMeta{
+		Name:  lr.EventName(),
+		Start: uint64(lr.Timestamp()),
+		Keys:  metaKeys(nil, lr.Attributes(), scopeLog, ""),
+	}
+}
+
+func logTokens(lr plog.LogRecord) []envelope.Entry {
+	entries := tokenEntries(nil, lr.Attributes(), scopeLog, "")
+	if lr.Body().Type() == pcommon.ValueTypeStr && envelope.IsToken(lr.Body().Str()) {
+		var pos string
+		if v, ok := lr.Attributes().Get(envelope.EventAttr); ok {
+			pos = v.AsString()
+		}
+		entries = append(entries, envelope.Entry{Scope: scopeLogBody, Position: pos, Token: lr.Body().Str()})
+	}
+	return entries
+}
+
 func (e *encryptor) processLog(ctx context.Context, lr plog.LogRecord) error {
+	traceID, spanID := lr.TraceID(), lr.SpanID()
+	rec := e.newRecord(signalLogs, lr.Attributes(), idBytes(traceID, traceID[:]), idBytes(spanID, spanID[:]),
+		func() envelope.RecordMeta { return logMeta(lr) },
+		func() []envelope.Entry { return logTokens(lr) })
+
 	// Select the body rule before attributes are encrypted: a rule may
 	// encrypt event.name, which must not turn body encryption off.
-	bodyRule := e.bodyRule(lr)
+	bodyRule, name := e.bodyRule(lr)
+	// An accepted upstream body keeps the event name it was bound to.
+	bodyPos := name
+	if rec.trusted {
+		if v, ok := lr.Attributes().Get(envelope.EventAttr); ok {
+			bodyPos = v.AsString()
+		}
+	}
 
-	traceID, spanID := lr.TraceID(), lr.SpanID()
-	rec := e.newRecord(signalLogs, lr.Attributes(), idBytes(traceID, traceID[:]), idBytes(spanID, spanID[:]))
 	if err := rec.processAttributes(ctx, lr.Attributes(), scopeLog, ""); err != nil {
 		return err
 	}
 	if bodyRule != nil {
-		if err := rec.seal(ctx, bodyRule, lr.Body(), scopeLogBody, "", ""); err != nil {
+		// The event name tells who said what (user, assistant, tool): it is
+		// bound to the body ciphertext and carried in clear text next to it.
+		if err := rec.seal(ctx, bodyRule, lr.Body(), scopeLogBody, bodyPos, ""); err != nil {
 			if err := e.fail(ctx, bodyRule, scopeLogBody, "", err); err != nil {
 				return err
 			}
 			lr.Body().SetStr("")
+		} else if bodyPos != "" && envelope.IsToken(lr.Body().Str()) {
+			lr.Attributes().PutStr(envelope.EventAttr, bodyPos)
 		}
 	}
 	return rec.finish(ctx)
 }
 
-func (e *encryptor) bodyRule(lr plog.LogRecord) *rule {
+// bodyRule returns the rule encrypting the body of lr, if any, and the
+// trusted event name of the record.
+func (e *encryptor) bodyRule(lr plog.LogRecord) (*rule, string) {
 	name, trusted := eventName(lr)
+	if !trusted {
+		name = ""
+	}
 	var first *rule
 	for _, r := range e.rules {
 		if !r.logBody {
@@ -524,16 +706,16 @@ func (e *encryptor) bodyRule(lr plog.LogRecord) *rule {
 		if first == nil {
 			first = r
 		}
-		if r.bodyEvents == nil || r.bodyEvents[name] {
-			return r
+		if r.bodyEvents == nil || (trusted && r.bodyEvents[name]) {
+			return r, name
 		}
 	}
 	if !trusted {
 		// The event name is unreadable: fail closed and encrypt the body
 		// with the first rule that encrypts bodies.
-		return first
+		return first, name
 	}
-	return nil
+	return nil, name
 }
 
 var errNoRules = errors.New("no encryption rule configured")

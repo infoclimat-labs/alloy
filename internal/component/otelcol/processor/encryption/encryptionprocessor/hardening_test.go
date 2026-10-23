@@ -82,7 +82,10 @@ func TestChainedTiers(t *testing.T) {
 	signer, err := envelope.GenerateSigningKey(envelope.SigEd25519)
 	require.NoError(t, err)
 
+	edgeSigner, err := envelope.GenerateSigningKey(envelope.SigEd25519)
+	require.NoError(t, err)
 	tier1 := config(RuleConfig{Recipients: []string{pubPEM(edge)}, Attributes: []string{"gen_ai.input.messages"}})
+	tier1.SigningKey = configString(edgeSigner)
 	td, span := newSpan()
 	span.Attributes().PutStr("gen_ai.input.messages", "prompt")
 	span.Attributes().PutStr("gen_ai.output.messages", "answer")
@@ -93,6 +96,7 @@ func TestChainedTiers(t *testing.T) {
 
 	tier2 := config(RuleConfig{Recipients: []string{pubPEM(central)}, Presets: []string{"gen_ai"}})
 	tier2.AcceptEncryptedInput = true
+	tier2.UpstreamVerifyKeys = []string{string(edgeSigner.Public().MarshalPEM())}
 	tier2.SigningKey = configString(signer)
 	out2, _, err := runTraces(t, tier2, out1)
 	require.NoError(t, err)

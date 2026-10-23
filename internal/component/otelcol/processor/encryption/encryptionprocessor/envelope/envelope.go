@@ -45,6 +45,11 @@ const (
 	RecordIDAttr = "encryption.rid"
 	// SignatureAttr carries the optional signature of a record.
 	SignatureAttr = "encryption.sig"
+	// MetaAttr carries the digest of the clear-text metadata of a signed
+	// record (see MetaDigest).
+	MetaAttr = "encryption.meta"
+	// EventAttr carries the event name bound to an encrypted log body.
+	EventAttr = "encryption.event"
 	// AttrPrefix is the common prefix of the attributes managed by the
 	// processor.
 	AttrPrefix = "encryption."
@@ -243,6 +248,16 @@ func (d *DEK) Open(token string, c Context) ([]byte, error) {
 		return nil, ErrAuthentication
 	}
 	return pt, nil
+}
+
+// IsMetaKey reports whether an attribute key is one of the attributes
+// managed by the processor.
+func IsMetaKey(k string) bool {
+	switch k {
+	case RecordIDAttr, SignatureAttr, MetaAttr, EventAttr:
+		return true
+	}
+	return strings.HasPrefix(k, WrappedKeyAttrPrefix)
 }
 
 // IsToken reports whether s looks like an encryption token.

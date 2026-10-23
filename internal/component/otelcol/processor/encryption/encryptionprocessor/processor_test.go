@@ -9,6 +9,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/collector/component/componenttest"
+	"go.opentelemetry.io/collector/config/configopaque"
 	"go.opentelemetry.io/collector/consumer/consumertest"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
@@ -232,12 +233,16 @@ func TestSegregationOfDuties(t *testing.T) {
 
 func TestIdempotent(t *testing.T) {
 	key := newKey(t, fastSuite)
+	signer, err := envelope.GenerateSigningKey(envelope.SigEd25519)
+	require.NoError(t, err)
 	cfg := config(RuleConfig{Recipients: []string{pubPEM(key)}, Presets: []string{"gen_ai"}})
+	cfg.SigningKey = configopaque.String(signer.MarshalPEM())
 	once, _, err := runTraces(t, cfg, genAITraces())
 	require.NoError(t, err)
 	snapshot := once.ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0).Attributes().AsRaw()
 
 	cfg.AcceptEncryptedInput = true
+	cfg.UpstreamVerifyKeys = []string{string(signer.Public().MarshalPEM())}
 	twice, reader, err := runTraces(t, cfg, once)
 	require.NoError(t, err)
 	require.Equal(t, snapshot, twice.ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0).Attributes().AsRaw())

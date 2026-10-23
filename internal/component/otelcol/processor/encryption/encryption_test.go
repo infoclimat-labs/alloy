@@ -39,6 +39,7 @@ func TestArguments_UnmarshalAlloy(t *testing.T) {
 		on_error = "reject"
 		signing_key = ` + alloyString(string(sk.MarshalPEM())) + `
 		accept_encrypted_input = true
+		upstream_verify_keys = [` + alloyString(string(sk.Public().MarshalPEM())) + `]
 
 		key_rotation {
 			max_values = 1000
@@ -71,6 +72,7 @@ func TestArguments_UnmarshalAlloy(t *testing.T) {
 	require.Equal(t, encryptionprocessor.OnErrorReject, c.OnError)
 	require.Equal(t, string(sk.MarshalPEM()), string(c.SigningKey))
 	require.True(t, c.AcceptEncryptedInput)
+	require.Len(t, c.UpstreamVerifyKeys, 1)
 	require.Equal(t, uint64(1000), c.KeyRotation.MaxValues)
 	require.Equal(t, time.Minute, c.KeyRotation.MaxAge)
 	require.Len(t, c.Rules, 2)

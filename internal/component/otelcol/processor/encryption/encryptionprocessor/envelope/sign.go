@@ -229,6 +229,58 @@ type Manifest struct {
 	Entries  []Entry
 	// WrappedKeys maps DEK IDs to wrapped-key attribute values.
 	WrappedKeys map[string]string
+	// Meta is the digest of the clear-text metadata of the record, see
+	// MetaDigest. It is carried in the MetaAttr attribute.
+	Meta []byte
+}
+
+// RecordMeta describes the clear-text parts of a record that a signature
+// covers besides the encrypted values: names, timestamps and the set of
+// attribute keys. It makes added, removed or renamed attributes, and
+// replayed or retimed records, detectable. Clear-text attribute values are
+// not covered.
+type RecordMeta struct {
+	// Name is the span name, or the log event name.
+	Name string
+	// Start and End are the span timestamps; Start is the log timestamp.
+	Start, End uint64
+	// Events lists the span events as "<position>@<time>".
+	Events []string
+	// Keys lists every attribute key of the record, its events and links,
+	// as "<scope>|<position>|<key>", excluding processor metadata keys.
+	Keys []string
+}
+
+// MetaDigest canonicalizes record metadata.
+func MetaDigest(m RecordMeta) []byte {
+	keys := slices.Clone(m.Keys)
+	slices.Sort(keys)
+	var buf bytes.Buffer
+	put := func(b []byte) {
+		var l [4]byte
+		binary.BigEndian.PutUint32(l[:], uint32(len(b)))
+		buf.Write(l[:])
+		buf.Write(b)
+	}
+	put([]byte("otel-encryption/v1 meta"))
+	put([]byte(m.Name))
+	put(binary.BigEndian.AppendUint64(nil, m.Start))
+	put(binary.BigEndian.AppendUint64(nil, m.End))
+	put(binary.BigEndian.AppendUint32(nil, uint32(len(m.Events))))
+	for _, e := range m.Events {
+		put([]byte(e))
+	}
+	put(binary.BigEndian.AppendUint32(nil, uint32(len(keys))))
+	for _, k := range keys {
+		put([]byte(k))
+	}
+	sum := sha256.Sum256(buf.Bytes())
+	return sum[:]
+}
+
+// MetaKey renders an entry of RecordMeta.Keys.
+func MetaKey(scope, position, key string) string {
+	return scope + "|" + position + "|" + key
 }
 
 // digest canonicalizes the manifest. Keys are normalized so that a
@@ -272,6 +324,7 @@ func (m Manifest) digest() []byte {
 		put([]byte(id))
 		put([]byte(m.WrappedKeys[id]))
 	}
+	put(m.Meta)
 	sum := sha256.Sum256(buf.Bytes())
 	return sum[:]
 }

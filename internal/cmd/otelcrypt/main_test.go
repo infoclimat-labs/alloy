@@ -5,6 +5,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -44,15 +47,19 @@ func encryptedDoc(t *testing.T, pubPEM []byte, signer *envelope.SigningKey) []by
 		map[string]any{"key": envelope.RecordIDAttr, "value": map[string]any{"stringValue": hex.EncodeToString(rid)}},
 	}
 	if signer != nil {
+		meta := envelope.MetaDigest(envelope.RecordMeta{Keys: []string{envelope.MetaKey("span", "", key)}})
 		sig, err := signer.Sign(envelope.Manifest{
 			Signal: "traces", RecordID: rid, TraceID: tid, SpanID: sid,
 			Entries:     []envelope.Entry{{Scope: "span", Key: key, Token: tok}},
 			WrappedKeys: map[string]string{dek.ID(): dek.WrappedKey()},
+			Meta:        meta,
 		})
 		if err != nil {
 			t.Fatal(err)
 		}
-		attrs = append(attrs, map[string]any{"key": envelope.SignatureAttr, "value": map[string]any{"stringValue": sig}})
+		attrs = append(attrs,
+			map[string]any{"key": envelope.SignatureAttr, "value": map[string]any{"stringValue": sig}},
+			map[string]any{"key": envelope.MetaAttr, "value": map[string]any{"stringValue": hex.EncodeToString(meta)}})
 	}
 	doc, _ := json.Marshal(map[string]any{"resourceSpans": []any{map[string]any{"scopeSpans": []any{map[string]any{"spans": []any{map[string]any{
 		"traceId": hex.EncodeToString(tid), "spanId": hex.EncodeToString(sid), "attributes": attrs,
@@ -125,7 +132,7 @@ func TestKeygenAndDecrypt(t *testing.T) {
 		t.Fatal(err)
 	}
 	if rec.Reason != "contrôle d'emploi #42" || rec.Decrypted != 1 || rec.Keys[0] != pk.KeyID() || len(rec.InputSHA256) != 64 ||
-		rec.Prev != "" || len(rec.TraceIDs) != 1 || !rec.OutputWritten {
+		rec.Prev != "" || len(rec.TraceIDs) != 1 || !rec.ClearTextReleased {
 
 		t.Fatalf("audit record = %+v", rec)
 	}
@@ -133,6 +140,14 @@ func TestKeygenAndDecrypt(t *testing.T) {
 	out, _, err := runCLI(t, "", "audit-verify", "-in", audit)
 	if err != nil || !strings.Contains(out, "2 record(s), hash chain intact") {
 		t.Fatalf("audit-verify: %v %s", err, out)
+	}
+	headHash := strings.Fields(strings.SplitN(out, "head ", 2)[1])[0]
+	// Truncating the trail is detected when the head is known.
+	if err := os.WriteFile(audit+".trunc", []byte(lines[0]+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := runCLI(t, "", "audit-verify", "-in", audit+".trunc", "-head", headHash); err == nil {
+		t.Fatal("truncated trail not detected")
 	}
 	// Tampering with the first record breaks the chain.
 	tampered := strings.Replace(string(trail), "contrôle d'emploi #42", "routine check", 1)
@@ -213,6 +228,36 @@ func TestSignatures(t *testing.T) {
 	}
 	if _, _, err := runCLI(t, signed, "decrypt", "-key", priv, "-reason", "r", "-audit-log", audit, "-require-signature"); err == nil {
 		t.Fatal("-require-signature without -verify-key accepted")
+	}
+}
+
+func TestRemoteAudit(t *testing.T) {
+	dir := t.TempDir()
+	priv, pub := filepath.Join(dir, "k"), filepath.Join(dir, "p")
+	if _, _, err := runCLI(t, "", "keygen", "-kem", "X25519", "-private", priv, "-public", pub); err != nil {
+		t.Fatal(err)
+	}
+	pubPEM, _ := os.ReadFile(pub)
+	doc := string(encryptedDoc(t, pubPEM, nil))
+
+	var received [][]byte
+	ok := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		received = append(received, b)
+	}))
+	defer ok.Close()
+	out, _, err := runCLI(t, doc, "decrypt", "-key", priv, "-reason", "r", "-audit-log", filepath.Join(dir, "a"), "-audit-url", ok.URL)
+	if err != nil || len(received) != 1 || !strings.Contains(string(received[0]), `"reason":"r"`) || !strings.Contains(out, "secret prompt") {
+		t.Fatalf("remote audit: %v %d", err, len(received))
+	}
+
+	failing := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer failing.Close()
+	out, _, err = runCLI(t, doc, "decrypt", "-key", priv, "-reason", "r", "-audit-log", filepath.Join(dir, "a"), "-audit-url", failing.URL)
+	if err == nil || strings.Contains(out, "secret prompt") {
+		t.Fatal("output released although the remote audit failed")
 	}
 }
 

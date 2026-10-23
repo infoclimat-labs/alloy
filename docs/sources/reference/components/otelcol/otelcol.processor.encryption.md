@@ -44,7 +44,8 @@ You can use the following arguments with `otelcol.processor.encryption`:
 | ------------------------ | -------- | --------------------------------------------------------------------------- | ---------- | -------- |
 | `accept_encrypted_input` | `bool`   | Keep values that another {{< param "PRODUCT_NAME" >}} instance already encrypted. | `false` | no       |
 | `on_error`               | `string` | What to do with a value that can't be encrypted.                            | `"delete"` | no       |
-| `signing_key`            | `secret` | PEM-encoded key used to sign every record that carries encrypted values.    | `""`       | no       |
+| `signing_key`            | `secret` | PEM-encoded key used to sign every record.                                  | `""`       | no       |
+| `upstream_verify_keys`   | `list(string)` | PEM-encoded verification keys of the upstream instances whose encrypted values are kept. | `[]` | no |
 
 `on_error` accepts the following values:
 
@@ -54,16 +55,21 @@ You can use the following arguments with `otelcol.processor.encryption`:
 {{< param "PRODUCT_NAME" >}} never forwards a value in clear text when encryption fails.
 
 Encryption alone protects confidentiality, not authenticity: anyone who holds a recipient public key can produce values that decrypt.
-When you set `signing_key`, `otelcol.processor.encryption` signs each span or log record it encrypts.
-The signature covers the record ID, the trace and span IDs, the wrapped keys, and every encrypted value with its location.
-A decryptor that pins the matching verification key detects forged, moved, altered, or deleted values.
+When you set `signing_key`, `otelcol.processor.encryption` signs every span and log record that it processes, including records without encrypted values.
+The signature covers the record ID, the trace and span IDs, the wrapped keys, every encrypted value with its location, and a digest of the clear-text metadata of the record, stored in `encryption.meta`.
+The metadata digest covers the span name and timestamps, the event names and timestamps, the log timestamp and event name, and the set of attribute keys.
+It doesn't cover clear-text attribute values.
+A decryptor that pins the matching verification key detects forged, moved, altered, or deleted values, added or removed attributes, and records stripped of their encryption.
+Loki rewrites attribute names, so for logs read from Loki only the encrypted values and the signed digest are checked, not the recomputed metadata.
 Generate the key pair with `otelcrypt keygen -signing`.
 The supported algorithms are `Ed25519` (default, about 30 µs per record) and the post-quantum `ML-DSA-65` and `ML-DSA-87` (about 1 ms per record).
 
 By default, `otelcol.processor.encryption` doesn't trust encryption metadata in incoming data.
 It removes incoming `encryption.*` attributes and encrypts values that look like encrypted values like any other value, so a client can't smuggle clear text past the processor.
 Set `accept_encrypted_input` to `true` on a second {{< param "PRODUCT_NAME" >}} tier to keep the values that the first tier encrypted.
-Values are only kept when they're well-formed and their wrapped key is present on the same record.
+You must also set `upstream_verify_keys` to the verification keys of the first tier, which must set `signing_key`.
+Encrypted values of a record are only kept when the record carries a valid signature from one of these keys.
+Otherwise they're treated as clear text and encrypted again, because anyone who holds a recipient public key can forge encrypted values.
 
 ## Blocks
 
@@ -182,7 +188,9 @@ enc:v1:<DATA_KEY_ID>:<BASE64URL_CIPHERTEXT>
 
 * `encryption.rid`: A random record ID.
 * `encryption.dek.<DATA_KEY_ID>`: The wrapped data encryption key.
-* `encryption.sig`: The record signature, when `signing_key` is set.
+* `encryption.sig` and `encryption.meta`: The record signature and the digest of the clear-text metadata, when `signing_key` is set.
+* `encryption.event`: The event name of a log record whose body is encrypted.
+  The event name tells whether the body is a user, assistant, or tool message, so it's bound to the ciphertext.
 
 Every span or log record therefore carries what its recipients need to decrypt it, and stays decryptable after sampling, batching, or export to any backend.
 
@@ -235,7 +243,9 @@ curl -s http://tempo:3200/api/traces/<TRACE_ID> \
 
 `otelcrypt decrypt` requires a justification and appends a record to a hash-chained audit trail, `otelcrypt-audit.jsonl` by default, before it releases any clear text.
 The record contains the user, the input digest, the keys used, the decrypted traces, and the number of decrypted values.
-Check the integrity of the trail with `otelcrypt audit-verify`.
+Set `-audit-url`, or the `OTELCRYPT_AUDIT_URL` environment variable, to also send each record to a remote append-only log; the output is withheld if the remote log rejects the record.
+Check the integrity of the trail with `otelcrypt audit-verify`, and pass the last known head hash with `-head` to detect a truncated trail.
+A local trail can be rewritten by whoever controls the workstation, so prefer a remote log for accountability.
 `otelcrypt decrypt` accepts OTLP JSON traces and logs, Tempo API responses, and Loki query responses.
 
 `otelcrypt inspect` lists the data encryption keys and recipients found in a document without decrypting it.

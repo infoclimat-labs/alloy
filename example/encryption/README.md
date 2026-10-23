@@ -99,14 +99,22 @@ to 2048 bytes by default, which would corrupt ciphertexts and wrapped keys.
   record or trace makes it undecryptable. Keys are bound in their sanitized
   form (`[A-Za-z0-9_]`) so values stay decryptable after Loki rewrites
   attribute names; the exact key is encrypted with the value and checked.
-* **Record signatures (optional, recommended).** Alloy signs each record
-  (Ed25519, or ML-DSA-65/87) over the record ID, IDs, wrapped keys and every
-  token with its location. With `-require-signature`, `otelcrypt` refuses
-  forged records, including ones built with a recipient public key, and
-  detects moved, altered or deleted values.
-* **Untrusted input.** Incoming `encryption.*` attributes are dropped and
-  token-looking values are encrypted like any other value, unless
-  `accept_encrypted_input` is set on a second Alloy tier.
+* **Record signatures (optional, recommended).** Alloy signs every record
+  (Ed25519, or ML-DSA-65/87), with or without encrypted values, over the
+  record ID, IDs, wrapped keys, every token with its location and a digest of
+  the clear-text metadata (span name, timestamps, event names and times, set
+  of attribute keys). With `-require-signature`, `otelcrypt` refuses forged
+  records, including ones built with a recipient public key, and detects
+  moved, altered or deleted values, injected or removed attributes and
+  records stripped of their encryption. Clear-text attribute values aren't
+  covered. Loki rewrites attribute names: for Loki exports the metadata
+  digest is taken as signed, not recomputed.
+* **Untrusted input.** Incoming processor attributes are dropped and
+  token-looking values are encrypted like any other value. A second Alloy tier
+  with `accept_encrypted_input` keeps encrypted values only from records that
+  carry a valid signature from a pinned upstream key.
+* **Who said what.** The event name of an encrypted log body (user,
+  assistant, tool message) is bound to the ciphertext.
 * **Header authentication.** The wrapped-key blob header (version, suite, key
   ID) is part of the HPKE `info`, so it can't be altered without detection.
 * **Typed values.** Maps, lists, numbers and byte arrays are restored with
@@ -137,19 +145,22 @@ signature       : Sign(SHA-256(canonical manifest: signal, rid, IDs, sorted entr
 | Compromise of the Alloy cluster                          | Alloy holds public keys only: telemetry already stored stays confidential. A live attacker can read new traffic in memory and sign records with Alloy's key, as with any in-line processor. |
 | Leak of a DEK from Alloy memory                          | Bounded by the rotation window (10 minutes / 2^24 values by default; best effort, Go can't wipe memory). |
 | Forged records (anyone holding a recipient public key)   | Record signatures, verified with `-require-signature`. Without a signing key the scheme gives confidentiality only. |
-| Tokens moved, swapped or deleted to alter evidence       | AEAD binding to record ID, position, key and IDs; deletions detected by the signature. |
-| Client smuggles clear text with an `enc:v1:` prefix      | Incoming tokens and `encryption.*` attributes aren't trusted by default.   |
+| Forged values laundered through a second Alloy tier      | Upstream values kept only with a valid signature from a pinned upstream key. |
+| Tokens moved, swapped or deleted to alter evidence       | AEAD binding to record ID, position, key, event name and IDs; deletions detected by the signature. |
+| Clear text injected next to signed content, record stripped of its encryption | Metadata digest (attribute key set, names, timestamps) in the signature; every record signed. |
+| Client smuggles clear text with an `enc:v1:` prefix      | Incoming tokens and processor attributes aren't trusted by default.        |
 | Encrypted `event.name` disables body encryption          | The body rule is resolved before attributes; unreadable names fail closed. |
 | "Harvest now, decrypt later" on long-term archives       | Post-quantum hybrid KEM by default; ML-DSA signatures available.           |
 | Encryption failure leaks clear text                      | Fail-closed: `on_error = "delete"` (default) or `"reject"`.                 |
 | Backend truncates long values                            | Detected (AEAD failure, with a hint); configure the backend (Tempo `max_attribute_bytes`). |
-| Unaccountable decryption                                 | Mandatory reason; hash-chained audit trail written before clear text is released; `audit-verify`. |
+| Unaccountable decryption                                 | Mandatory reason; locked, hash-chained audit trail written before clear text is released; optional remote audit sink (`-audit-url`) that must accept the record; `audit-verify -head` detects truncation. A local trail alone can be rewritten by the workstation owner. |
 | One team reads another team's data                       | One rule per audience, each with its own recipients; first matching rule wins. |
 
 Out of scope for this proof of concept: protecting the private keys (use an
-HSM or an offline vault), a tamper-proof remote audit sink, hiding metadata
-(span names, resource attributes, attribute keys, value sizes and timing remain
-visible), and searching inside encrypted content.
+HSM or an offline vault), integrity of clear-text attribute values and of
+resource attributes, hiding metadata (span names, resource attributes,
+attribute keys, value sizes and timing remain visible), and searching inside
+encrypted content.
 
 ### GDPR and AI Act notes
 

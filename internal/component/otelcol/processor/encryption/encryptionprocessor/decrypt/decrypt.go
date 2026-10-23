@@ -44,6 +44,10 @@ type Report struct {
 	Verified int `json:"signatures_verified"`
 	Unsigned int `json:"unsigned_records"`
 	Invalid  int `json:"invalid_signatures"`
+	// MetaUnchecked counts verified records whose clear-text metadata
+	// couldn't be recomputed (Loki rewrites attribute names): only their
+	// encrypted values are verified.
+	MetaUnchecked int `json:"metadata_unchecked"`
 	// TraceIDs lists the traces whose content was decrypted (at most 1000).
 	TraceIDs []string `json:"trace_ids,omitempty"`
 	Errors   []string `json:"errors,omitempty"`
@@ -178,6 +182,14 @@ type recordState struct {
 	wrapped map[string]string
 	sig     string
 	entries []envelope.Entry
+	// meta is the digest of the clear-text metadata of the record,
+	// recomputed from the document, unless metaFromAttr is set (the backend
+	// rewrote the record) and the signed MetaAttr value is used instead.
+	meta         []byte
+	metaFromAttr bool
+	metaAttr     string
+	// event is the event name bound to an encrypted log body.
+	event string
 	// exactKeys is false when the backend sanitized attribute names.
 	exactKeys bool
 	// allowed is false when the record must not be decrypted (signature
@@ -220,6 +232,10 @@ func (st *recordState) readMeta(attrs []kv) {
 			st.ctx.RecordID, _ = hex.DecodeString(s)
 		case envelope.SignatureAttr:
 			st.sig = s
+		case envelope.MetaAttr:
+			st.metaAttr = s
+		case envelope.EventAttr:
+			st.event = s
 		default:
 			if id, ok := strings.CutPrefix(a.key, envelope.WrappedKeyAttrPrefix); ok {
 				st.wrapped[id] = s
@@ -233,14 +249,29 @@ func (st *recordState) collect(scope, position, key, token string) {
 	st.entries = append(st.entries, envelope.Entry{Scope: scope, Position: position, Key: key, Token: token})
 }
 
-// verify checks the record signature once every token is collected.
+// verify checks the record signature once every token is collected. With
+// a verifier, every record is checked, including records without encrypted
+// values: the processor signs them all, so a record stripped of its
+// encryption (values replaced by clear text) is reported.
 func (d *Decryptor) verify(st *recordState, rep *Report) {
 	st.allowed = true
-	if len(st.entries) == 0 {
+	if len(st.entries) > 0 {
+		rep.Records++
+	}
+	if d.opts.Verifier.Len() == 0 {
 		return
 	}
-	rep.Records++
-	if d.opts.Verifier.Len() == 0 {
+	reject := func(err error, counter *int) {
+		*counter++
+		if d.opts.RequireSignature {
+			st.allowed = false
+			rep.fail(st.where, err)
+		} else if len(rep.Errors) < 100 && len(st.entries) > 0 {
+			rep.Errors = append(rep.Errors, fmt.Sprintf("%s: %v (decrypted anyway)", st.where, err))
+		}
+	}
+	if st.sig == "" {
+		reject(errors.New("record is not signed"), &rep.Unsigned)
 		return
 	}
 	used := map[string]string{}
@@ -251,12 +282,11 @@ func (d *Decryptor) verify(st *recordState, rep *Report) {
 			}
 		}
 	}
-	if st.sig == "" {
-		rep.Unsigned++
-		st.allowed = !d.opts.RequireSignature
-		if !st.allowed {
-			rep.fail(st.where, errors.New("record is not signed"))
-		}
+	meta := st.meta
+	if st.metaFromAttr {
+		meta, _ = hex.DecodeString(st.metaAttr)
+	} else if hex.EncodeToString(meta) != st.metaAttr {
+		reject(errors.New("clear-text metadata of the record was altered (attributes added, removed or renamed, or timestamps changed)"), &rep.Invalid)
 		return
 	}
 	_, err := d.opts.Verifier.Verify(envelope.Manifest{
@@ -266,18 +296,16 @@ func (d *Decryptor) verify(st *recordState, rep *Report) {
 		SpanID:      st.ctx.SpanID,
 		Entries:     st.entries,
 		WrappedKeys: used,
+		Meta:        meta,
 	}, st.sig)
 	if err != nil {
-		rep.Invalid++
-		st.allowed = !d.opts.RequireSignature
-		if d.opts.RequireSignature {
-			rep.fail(st.where, err)
-		} else if len(rep.Errors) < 100 {
-			rep.Errors = append(rep.Errors, fmt.Sprintf("%s: %v (decrypted anyway)", st.where, err))
-		}
+		reject(err, &rep.Invalid)
 		return
 	}
 	rep.Verified++
+	if st.metaFromAttr {
+		rep.MetaUnchecked++
+	}
 }
 
 func (d *Decryptor) dek(id string, st *recordState) (*envelope.DEK, error) {
@@ -353,7 +381,7 @@ type location struct {
 func tokensOf(m map[string]any) []kv {
 	var out []kv
 	for _, a := range attributes(m) {
-		if s, ok := strValue(a); ok && envelope.IsToken(s) && !strings.HasPrefix(a.key, envelope.AttrPrefix) {
+		if s, ok := strValue(a); ok && envelope.IsToken(s) && !envelope.IsMetaKey(a.key) {
 			out = append(out, a)
 		}
 	}
@@ -401,7 +429,7 @@ func (d *Decryptor) stripKeys(m map[string]any) {
 	out := in[:0]
 	for _, a := range in {
 		if am, ok := a.(map[string]any); ok {
-			if k, _ := am["key"].(string); strings.HasPrefix(k, envelope.AttrPrefix) {
+			if k, _ := am["key"].(string); envelope.IsMetaKey(k) {
 				continue
 			}
 		}
@@ -423,19 +451,54 @@ func (d *Decryptor) traces(root map[string]any, rep *Report) {
 				}}
 				st.where = fmt.Sprintf("span %x/%x", st.ctx.TraceID, st.ctx.SpanID)
 				st.readMeta(attributes(span))
+				name, _ := span["name"].(string)
+				meta := envelope.RecordMeta{Name: name, Start: timestamp(span["startTimeUnixNano"]), End: timestamp(span["endTimeUnixNano"])}
+				meta.Keys = metaKeys(meta.Keys, span, "span", "")
 				locs := []location{{m: span, scope: "span", where: st.where}}
 				for i, ev := range objects(list(span, "events")) {
-					name, _ := ev["name"].(string)
-					locs = append(locs, location{m: ev, scope: "span_event", position: position(i, name), where: st.where + " event " + strconv.Itoa(i)})
+					evName, _ := ev["name"].(string)
+					pos := position(i, evName)
+					meta.Events = append(meta.Events, pos+"@"+strconv.FormatUint(timestamp(ev["timeUnixNano"]), 10))
+					meta.Keys = metaKeys(meta.Keys, ev, "span_event", pos)
+					locs = append(locs, location{m: ev, scope: "span_event", position: pos, where: st.where + " event " + strconv.Itoa(i)})
 				}
 				for i, link := range objects(list(span, "links")) {
-					locs = append(locs, location{m: link, scope: "span_link", position: position(i, linkSpanID(link["spanId"])), where: st.where + " link " + strconv.Itoa(i)})
+					pos := position(i, linkSpanID(link["spanId"]))
+					meta.Keys = metaKeys(meta.Keys, link, "span_link", pos)
+					locs = append(locs, location{m: link, scope: "span_link", position: pos, where: st.where + " link " + strconv.Itoa(i)})
 				}
+				st.meta = envelope.MetaDigest(meta)
 				d.decryptLocations(st, locs, rep)
 				d.stripKeys(span)
 			}
 		}
 	}
+}
+
+// timestamp parses an OTLP JSON timestamp, encoded as a string or a number.
+func timestamp(v any) uint64 {
+	var s string
+	switch t := v.(type) {
+	case string:
+		s = t
+	case json.Number:
+		s = t.String()
+	default:
+		return 0
+	}
+	n, _ := strconv.ParseUint(s, 10, 64)
+	return n
+}
+
+// metaKeys appends the attribute keys of an OTLP JSON object, as the
+// processor does when it computes the metadata digest.
+func metaKeys(keys []string, m map[string]any, scope, position string) []string {
+	for _, a := range attributes(m) {
+		if !envelope.IsMetaKey(a.key) {
+			keys = append(keys, envelope.MetaKey(scope, position, a.key))
+		}
+	}
+	return keys
 }
 
 // linkSpanID renders a link span ID like pcommon.SpanID.String (hex).
@@ -457,6 +520,12 @@ func (d *Decryptor) logs(root map[string]any, rep *Report) {
 				}}
 				st.where = fmt.Sprintf("log %x/%x", st.ctx.TraceID, st.ctx.SpanID)
 				st.readMeta(attributes(lr))
+				eventName, _ := lr["eventName"].(string)
+				st.meta = envelope.MetaDigest(envelope.RecordMeta{
+					Name:  eventName,
+					Start: timestamp(lr["timeUnixNano"]),
+					Keys:  metaKeys(nil, lr, "log", ""),
+				})
 
 				body, _ := lr["body"].(map[string]any)
 				bodyTok, _ := body["stringValue"].(string)
@@ -464,11 +533,11 @@ func (d *Decryptor) logs(root map[string]any, rep *Report) {
 					bodyTok = ""
 				}
 				if bodyTok != "" {
-					st.collect("log_body", "", "", bodyTok)
+					st.collect("log_body", st.event, "", bodyTok)
 				}
 				d.decryptLocations(st, []location{{m: lr, scope: "log", where: st.where}}, rep)
 				if bodyTok != "" && st.allowed {
-					v, err := d.open(bodyTok, "log_body", "", "", st)
+					v, err := d.open(bodyTok, "log_body", st.event, "", st)
 					if err == nil {
 						var av map[string]any
 						if av, err = toAnyValue(v); err == nil {

@@ -12,10 +12,11 @@ import (
 // the log line. The encryption processor binds normalized keys and embeds the
 // exact key in the plaintext, so values decrypt and the key is still checked.
 var (
-	lokiAttrPrefix       = envelope.NormalizeKey(envelope.AttrPrefix)
 	lokiWrappedKeyPrefix = envelope.NormalizeKey(envelope.WrappedKeyAttrPrefix)
 	lokiRecordIDLabel    = envelope.NormalizeKey(envelope.RecordIDAttr)
 	lokiSignatureLabel   = envelope.NormalizeKey(envelope.SignatureAttr)
+	lokiMetaLabel        = envelope.NormalizeKey(envelope.MetaAttr)
+	lokiEventLabel       = envelope.NormalizeKey(envelope.EventAttr)
 )
 
 func isLoki(root map[string]any) bool {
@@ -81,11 +82,17 @@ func lookup(name string, maps ...map[string]any) string {
 }
 
 func isMetaLabel(k string) bool {
-	return strings.HasPrefix(k, lokiAttrPrefix) || strings.HasPrefix(k, envelope.AttrPrefix)
+	switch k {
+	case lokiRecordIDLabel, lokiSignatureLabel, lokiMetaLabel, lokiEventLabel:
+		return true
+	}
+	return envelope.IsMetaKey(k) || strings.HasPrefix(k, lokiWrappedKeyPrefix)
 }
 
 func (d *Decryptor) lokiEntry(e []any, labels, meta map[string]any, rep *Report) {
-	st := &recordState{ctx: envelope.Context{
+	// Loki rewrites attribute names and adds labels of its own: the
+	// metadata digest can't be recomputed, only the signed one is used.
+	st := &recordState{metaFromAttr: true, ctx: envelope.Context{
 		Signal:  "logs",
 		TraceID: decodeID(lookup("trace_id", meta, labels), 16),
 		SpanID:  decodeID(lookup("span_id", meta, labels), 8),
@@ -106,6 +113,10 @@ func (d *Decryptor) lokiEntry(e []any, labels, meta map[string]any, rep *Report)
 				st.ctx.RecordID, _ = hex.DecodeString(s)
 			case lokiSignatureLabel, envelope.SignatureAttr:
 				st.sig = s
+			case lokiMetaLabel, envelope.MetaAttr:
+				st.metaAttr = s
+			case lokiEventLabel, envelope.EventAttr:
+				st.event = s
 			default:
 				if id, ok := strings.CutPrefix(k, lokiWrappedKeyPrefix); ok {
 					st.wrapped[id] = s
@@ -121,7 +132,13 @@ func (d *Decryptor) lokiEntry(e []any, labels, meta map[string]any, rep *Report)
 		key, tok string
 	}
 	var toks []labelToken
-	for _, m := range []map[string]any{labels, meta} {
+	// With categorized labels, structured metadata is per entry: tokens of
+	// the stream labels belong to other records.
+	sources := []map[string]any{labels}
+	if len(meta) > 0 {
+		sources = []map[string]any{meta}
+	}
+	for _, m := range sources {
 		for k, v := range m {
 			if s, ok := v.(string); ok && envelope.IsToken(s) && !isMetaLabel(k) {
 				toks = append(toks, labelToken{m, k, s})
@@ -131,7 +148,7 @@ func (d *Decryptor) lokiEntry(e []any, labels, meta map[string]any, rep *Report)
 	}
 	line, _ := e[1].(string)
 	if envelope.IsToken(line) {
-		st.collect("log_body", "", "", line)
+		st.collect("log_body", st.event, "", line)
 	} else {
 		line = ""
 	}
@@ -150,7 +167,7 @@ func (d *Decryptor) lokiEntry(e []any, labels, meta map[string]any, rep *Report)
 		rep.Decrypted++
 	}
 	if line != "" {
-		v, err := d.open(line, "log_body", "", "", st)
+		v, err := d.open(line, "log_body", st.event, "", st)
 		if err != nil {
 			rep.fail(st.where+" line", err)
 		} else {

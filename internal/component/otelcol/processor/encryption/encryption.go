@@ -39,8 +39,13 @@ type Arguments struct {
 	// SigningKey is an optional PEM encoded record signing key.
 	SigningKey alloytypes.Secret `alloy:"signing_key,attr,optional"`
 
-	// AcceptEncryptedInput keeps values already encrypted by another tier.
+	// AcceptEncryptedInput keeps values already encrypted by another tier,
+	// when the record is signed by one of UpstreamVerifyKeys.
 	AcceptEncryptedInput bool `alloy:"accept_encrypted_input,attr,optional"`
+
+	// UpstreamVerifyKeys are the PEM encoded verification keys of the
+	// upstream tiers.
+	UpstreamVerifyKeys []string `alloy:"upstream_verify_keys,attr,optional"`
 
 	// KeyRotation controls data encryption key rotation.
 	KeyRotation KeyRotationArguments `alloy:"key_rotation,block,optional"`
@@ -109,6 +114,7 @@ func (args Arguments) Convert() (otelcomponent.Config, error) {
 	cfg.OnError = encryptionprocessor.OnError(args.OnError)
 	cfg.SigningKey = configopaque.String(args.SigningKey)
 	cfg.AcceptEncryptedInput = args.AcceptEncryptedInput
+	cfg.UpstreamVerifyKeys = append([]string(nil), args.UpstreamVerifyKeys...)
 	cfg.KeyRotation = encryptionprocessor.KeyRotationConfig{
 		MaxValues: args.KeyRotation.MaxValues,
 		MaxAge:    args.KeyRotation.MaxAge,

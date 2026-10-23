@@ -22,6 +22,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/user"
 	"path/filepath"
@@ -259,23 +260,25 @@ func inspect(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 }
 
 type auditRecord struct {
-	Time          time.Time `json:"time"`
-	User          string    `json:"user"`
-	Host          string    `json:"host"`
-	Reason        string    `json:"reason"`
-	Input         string    `json:"input"`
-	InputSHA256   string    `json:"input_sha256"`
-	Keys          []string  `json:"keys"`
-	VerifyKeys    []string  `json:"verify_keys,omitempty"`
-	Format        string    `json:"format"`
-	Records       int       `json:"records"`
-	Decrypted     int       `json:"decrypted"`
-	Failed        int       `json:"failed"`
-	Verified      int       `json:"signatures_verified"`
-	Unsigned      int       `json:"unsigned_records"`
-	Invalid       int       `json:"invalid_signatures"`
-	TraceIDs      []string  `json:"trace_ids,omitempty"`
-	OutputWritten bool      `json:"output_written"`
+	Time        time.Time `json:"time"`
+	User        string    `json:"user"`
+	Host        string    `json:"host"`
+	Reason      string    `json:"reason"`
+	Input       string    `json:"input"`
+	InputSHA256 string    `json:"input_sha256"`
+	Keys        []string  `json:"keys"`
+	VerifyKeys  []string  `json:"verify_keys,omitempty"`
+	Format      string    `json:"format"`
+	Records     int       `json:"records"`
+	Decrypted   int       `json:"decrypted"`
+	Failed      int       `json:"failed"`
+	Verified    int       `json:"signatures_verified"`
+	Unsigned    int       `json:"unsigned_records"`
+	Invalid     int       `json:"invalid_signatures"`
+	TraceIDs    []string  `json:"trace_ids,omitempty"`
+	// ClearTextReleased is true when the run is about to release decrypted
+	// values: the record is written before the output.
+	ClearTextReleased bool `json:"clear_text_released"`
 	// Prev is the SHA-256 of the previous line of the trail, which makes
 	// edits and deletions detectable with audit-verify.
 	Prev string `json:"prev"`
@@ -290,7 +293,8 @@ func decryptCmd(args []string, stdin io.Reader, stdout, stderr io.Writer) error 
 	in := fs.String("in", "-", "input document (OTLP JSON traces or logs, Tempo API response, Loki query response)")
 	out := fs.String("out", "-", "output file, created with mode 0600; must not exist")
 	reason := fs.String("reason", "", "justification recorded in the audit trail (required)")
-	auditLog := fs.String("audit-log", defaultAuditLog, "audit trail file (JSON lines, hash chained)")
+	auditLog := fs.String("audit-log", envOr("OTELCRYPT_AUDIT_LOG", defaultAuditLog), "audit trail file (JSON lines, hash chained); default from $OTELCRYPT_AUDIT_LOG")
+	auditURL := fs.String("audit-url", os.Getenv("OTELCRYPT_AUDIT_URL"), "also POST each audit record to this URL (for example a remote append-only log); the output is withheld if it fails; default from $OTELCRYPT_AUDIT_URL")
 	keep := fs.Bool("keep-key-attributes", false, "keep the encryption.* attributes in the output")
 	maxSize := fs.Int64("max-size", defaultMaxSize, "maximum input size in bytes")
 	if err := fs.Parse(args); err != nil {
@@ -345,26 +349,32 @@ func decryptCmd(args []string, stdin io.Reader, stdout, stderr io.Writer) error 
 	// The audit record is written before any clear text is released.
 	sum := sha256.Sum256(doc)
 	rec := auditRecord{
-		Time:          time.Now().UTC(),
-		User:          currentUser(),
-		Host:          hostname(),
-		Reason:        *reason,
-		Input:         *in,
-		InputSHA256:   hex.EncodeToString(sum[:]),
-		Keys:          slices.Sorted(slices.Values(kr.KeyIDs())),
-		VerifyKeys:    vkids,
-		Format:        rep.Format,
-		Records:       rep.Records,
-		Decrypted:     rep.Decrypted,
-		Failed:        rep.Failed,
-		Verified:      rep.Verified,
-		Unsigned:      rep.Unsigned,
-		Invalid:       rep.Invalid,
-		TraceIDs:      rep.TraceIDs,
-		OutputWritten: rep.Decrypted > 0,
+		Time:              time.Now().UTC(),
+		User:              currentUser(),
+		Host:              hostname(),
+		Reason:            *reason,
+		Input:             *in,
+		InputSHA256:       hex.EncodeToString(sum[:]),
+		Keys:              slices.Sorted(slices.Values(kr.KeyIDs())),
+		VerifyKeys:        vkids,
+		Format:            rep.Format,
+		Records:           rep.Records,
+		Decrypted:         rep.Decrypted,
+		Failed:            rep.Failed,
+		Verified:          rep.Verified,
+		Unsigned:          rep.Unsigned,
+		Invalid:           rep.Invalid,
+		TraceIDs:          rep.TraceIDs,
+		ClearTextReleased: rep.Decrypted > 0,
 	}
-	if err := appendAudit(*auditLog, rec); err != nil {
+	line, err := appendAudit(*auditLog, rec)
+	if err != nil {
 		return fmt.Errorf("writing audit record (output withheld): %w", err)
+	}
+	if *auditURL != "" {
+		if err := postAudit(*auditURL, line); err != nil {
+			return fmt.Errorf("sending audit record to %s (output withheld): %w", *auditURL, err)
+		}
 	}
 
 	if *out == "" || *out == "-" {
@@ -408,39 +418,68 @@ func lastLineHash(path string) (string, error) {
 	return hex.EncodeToString(sum[:]), nil
 }
 
-func appendAudit(path string, rec auditRecord) error {
+func envOr(name, def string) string {
+	if v := os.Getenv(name); v != "" {
+		return v
+	}
+	return def
+}
+
+// appendAudit appends a record to the trail under an exclusive lock, so
+// concurrent runs can't fork the hash chain, and returns the written line.
+func appendAudit(path string, rec auditRecord) ([]byte, error) {
 	if dir := filepath.Dir(path); dir != "" {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
-			return err
+			return nil, err
 		}
 	}
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	if err := lockFile(f); err != nil {
+		return nil, fmt.Errorf("locking audit trail: %w", err)
+	}
+	defer func() { _ = unlockFile(f) }()
+
 	prev, err := lastLineHash(path)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	rec.Prev = prev
 	line, err := json.Marshal(rec)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600)
+	if _, err := f.Write(append(line, '\n')); err != nil {
+		return nil, err
+	}
+	if err := f.Sync(); err != nil {
+		return nil, err
+	}
+	return line, nil
+}
+
+// postAudit sends an audit record to a remote collector.
+func postAudit(url string, line []byte) error {
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Post(url, "application/json", bytes.NewReader(line))
 	if err != nil {
 		return err
 	}
-	if _, err := f.Write(append(line, '\n')); err != nil {
-		f.Close()
-		return err
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode/100 != 2 {
+		return fmt.Errorf("unexpected status %s", resp.Status)
 	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		return err
-	}
-	return f.Close()
+	return nil
 }
 
 func auditVerify(args []string, stdout, stderr io.Writer) error {
 	fs := newFlagSet("audit-verify", stderr)
-	in := fs.String("in", defaultAuditLog, "audit trail file")
+	in := fs.String("in", envOr("OTELCRYPT_AUDIT_LOG", defaultAuditLog), "audit trail file")
+	head := fs.String("head", "", "expected head hash, recorded elsewhere, to detect a truncated trail")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -468,7 +507,13 @@ func auditVerify(args []string, stdout, stderr io.Writer) error {
 	if err := sc.Err(); err != nil {
 		return err
 	}
+	if *head != "" && *head != prev {
+		return fmt.Errorf("head %s doesn't match the expected head %s: records were removed from the end of the trail", prev, *head)
+	}
 	_, _ = fmt.Fprintf(stdout, "%d record(s), hash chain intact, head %s\n", n, prev)
+	if *head == "" {
+		_, _ = fmt.Fprintln(stdout, "note: keep the head hash outside this machine to detect truncation (-head)")
+	}
 	return nil
 }
 

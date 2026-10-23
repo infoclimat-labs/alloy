@@ -43,12 +43,18 @@ type Config struct {
 	SigningKey configopaque.String `mapstructure:"signing_key"`
 
 	// AcceptEncryptedInput keeps values that are already encrypted, for
-	// example by another Alloy tier, instead of encrypting them again. A
-	// value is only kept when it is a well-formed token whose wrapped key is
-	// present on the record. When false (the default), incoming encryption
-	// attributes are removed and token-like values are encrypted like any
-	// other value, so a client can't smuggle clear text past the processor.
+	// example by another Alloy tier, instead of encrypting them again.
+	// Encrypted values of a record are only kept when the record carries a
+	// valid signature from one of UpstreamVerifyKeys; otherwise, and when
+	// false (the default), incoming encryption attributes are removed and
+	// token-like values are encrypted like any other value, so a client can't
+	// smuggle clear text or forged values past the processor.
 	AcceptEncryptedInput bool `mapstructure:"accept_encrypted_input"`
+
+	// UpstreamVerifyKeys are the PEM encoded verification keys of the
+	// upstream tiers whose signed records are accepted. Required by
+	// AcceptEncryptedInput.
+	UpstreamVerifyKeys []string `mapstructure:"upstream_verify_keys"`
 
 	_ struct{}
 }
@@ -122,6 +128,12 @@ func (cfg *Config) Validate() error {
 
 	if _, err := cfg.signingKey(); err != nil {
 		return fmt.Errorf("signing_key: %w", err)
+	}
+	if cfg.AcceptEncryptedInput && len(cfg.UpstreamVerifyKeys) == 0 {
+		return errors.New("accept_encrypted_input requires upstream_verify_keys: unsigned encrypted input can be forged by anyone holding a recipient public key")
+	}
+	if _, err := cfg.upstreamVerifier(); err != nil {
+		return fmt.Errorf("upstream_verify_keys: %w", err)
 	}
 
 	names := make(map[string]bool, len(cfg.Rules))
@@ -197,4 +209,19 @@ func (cfg *Config) signingKey() (*envelope.SigningKey, error) {
 		return nil, nil
 	}
 	return envelope.ParseSigningKey([]byte(cfg.SigningKey))
+}
+
+func (cfg *Config) upstreamVerifier() (*envelope.Verifier, error) {
+	if len(cfg.UpstreamVerifyKeys) == 0 {
+		return nil, nil
+	}
+	keys := make([]*envelope.VerifyKey, 0, len(cfg.UpstreamVerifyKeys))
+	for i, p := range cfg.UpstreamVerifyKeys {
+		k, err := envelope.ParseVerifyKey([]byte(p))
+		if err != nil {
+			return nil, fmt.Errorf("key #%d: %w", i, err)
+		}
+		keys = append(keys, k)
+	}
+	return envelope.NewVerifier(keys...), nil
 }

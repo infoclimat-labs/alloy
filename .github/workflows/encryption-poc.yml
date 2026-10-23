@@ -129,10 +129,13 @@ jobs:
           sha256: cfac593469d028d7ae5fe36e37bd7c59118b5238e92d8a876209578464f24a84
           install_args: go task golangci-lint shellcheck
 
+      # The full-repository lint needs a larger runner than ubuntu-latest:
+      # lint the packages of this proof of concept with the repository config.
       - name: Lint Go
         run: |
           set -o pipefail
-          task lint:go 2>&1 | tee lint.log
+          mise exec -- golangci-lint run --timeout 30m --build-tags nodocker \
+            ./internal/component/otelcol/processor/encryption/... ./internal/cmd/otelcrypt/... ./internal/component/all/... 2>&1 | tee lint.log
         id: lint
         continue-on-error: true
 
