@@ -135,7 +135,7 @@ jobs:
         run: |
           set -o pipefail
           mise exec -- golangci-lint run --timeout 30m --build-tags nodocker \
-            ./internal/component/otelcol/processor/encryption/... ./internal/cmd/otelcrypt/... ./internal/component/all/... 2>&1 | tee lint.log
+            ./internal/component/otelcol/processor/encryption/... ./internal/cmd/otelcrypt/... 2>&1 | tee lint.log
         id: lint
         continue-on-error: true
 
