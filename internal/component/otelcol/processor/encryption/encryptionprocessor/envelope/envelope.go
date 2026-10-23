@@ -40,6 +40,14 @@ import (
 const (
 	TokenPrefix          = "enc:v1:"
 	WrappedKeyAttrPrefix = "encryption.dek."
+	// RecordIDAttr carries the random identifier of a record bound into
+	// every ciphertext of the record.
+	RecordIDAttr = "encryption.rid"
+	// SignatureAttr carries the optional signature of a record.
+	SignatureAttr = "encryption.sig"
+	// AttrPrefix is the common prefix of the attributes managed by the
+	// processor.
+	AttrPrefix = "encryption."
 
 	blobMagic0  = 'O'
 	blobMagic1  = 'E'
@@ -63,19 +71,29 @@ var (
 	ErrNoMatchingKey  = errors.New("no private key matches the wrapped data encryption key")
 	ErrDEKMismatch    = errors.New("token does not belong to this data encryption key")
 	ErrAuthentication = errors.New("message authentication failed")
+	ErrDEKExhausted   = errors.New("data encryption key reached its usage limit")
 )
 
 // Context binds a ciphertext to its location in the telemetry. It is used as
-// AEAD additional data, so a token copied to another attribute, record or
-// trace fails to decrypt.
+// AEAD additional data, so a token copied to another attribute, event,
+// record or trace fails to decrypt.
 type Context struct {
 	// Signal is "traces" or "logs".
 	Signal string
-	// Scope is where the value lives: "span", "span_event", "log" or "log_body".
+	// Scope is where the value lives: "span", "span_event", "span_link",
+	// "log" or "log_body".
 	Scope string
+	// Position identifies the event or link inside its span, for example
+	// "3/gen_ai.content.prompt" for the fourth event. Empty otherwise.
+	Position string
 	// Key is the attribute key, or empty for a log body. It is bound in its
-	// normalized form, see NormalizeKey.
+	// normalized form, see NormalizeKey; the exact key is embedded in the
+	// plaintext (see EncodeValue).
 	Key string
+	// RecordID is the random identifier of the span or log record, carried in
+	// the RecordIDAttr attribute. It prevents moving tokens between records
+	// that share trace and span IDs, or have none.
+	RecordID []byte
 	// TraceID and SpanID are the raw identifiers of the record, if any.
 	TraceID []byte
 	SpanID  []byte
@@ -104,7 +122,9 @@ func (c Context) aad(dekID string) []byte {
 		[]byte(dekID),
 		[]byte(c.Signal),
 		[]byte(c.Scope),
+		[]byte(c.Position),
 		[]byte(NormalizeKey(c.Key)),
+		c.RecordID,
 		c.TraceID,
 		c.SpanID,
 	} {
@@ -139,6 +159,17 @@ func (c *counter) Add(delta uint64) {
 	c.mu.Unlock()
 }
 
+// TryAdd increments the counter unless it already reached limit.
+func (c *counter) TryAdd(limit uint64) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.n >= limit {
+		return false
+	}
+	c.n++
+	return true
+}
+
 func (c *counter) Load() uint64 {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -170,13 +201,20 @@ func (d *DEK) AttributeKey() string { return WrappedKeyAttrPrefix + d.id }
 // Uses returns how many values have been sealed with the key.
 func (d *DEK) Uses() uint64 { return d.uses.Load() }
 
+// MaxSealsPerDEK is a hard limit on the number of values sealed with one
+// DEK, whatever the rotation settings: beyond 2^32 messages, random 96-bit
+// GCM nonces no longer have a negligible collision probability.
+const MaxSealsPerDEK = 1 << 32
+
 // Seal encrypts plaintext and returns a token.
 func (d *DEK) Seal(plaintext []byte, c Context) (string, error) {
+	if !d.uses.TryAdd(MaxSealsPerDEK) {
+		return "", ErrDEKExhausted
+	}
 	nonce := make([]byte, nonceSize, nonceSize+len(plaintext)+d.aead.Overhead())
 	if _, err := io.ReadFull(d.rand, nonce); err != nil {
 		return "", fmt.Errorf("generating nonce: %w", err)
 	}
-	d.uses.Add(1)
 	sealed := d.aead.Seal(nonce, nonce, plaintext, c.aad(d.id))
 
 	var sb strings.Builder
@@ -336,6 +374,9 @@ func (s *Sealer) Recipients() []string {
 	return ids
 }
 
+// MaxUses returns the number of values after which a DEK is rotated.
+func (s *Sealer) MaxUses() uint64 { return s.maxUses }
+
 // Rotations returns how many DEKs the sealer has generated.
 func (s *Sealer) Rotations() uint64 { return s.rotations.Load() }
 
@@ -431,11 +472,13 @@ func checkBlob(blob []byte) error {
 
 // Unwrap recovers the DEK from a wrapped-key attribute value using any
 // matching private key. dekID, when non-empty, must match the identifier
-// derived from the wrapped value.
+// derived from the wrapped value. Every blob addressed to a key of the
+// keyring is tried, so a bogus blob can't hide a genuine one.
 func (kr *Keyring) Unwrap(dekID, wrapped string) (*DEK, error) {
 	if dekID != "" && subtle.ConstantTimeCompare([]byte(dekID), []byte(dekIDFor(wrapped))) != 1 {
 		return nil, ErrDEKMismatch
 	}
+	lastErr := ErrNoMatchingKey
 	for _, part := range strings.Split(wrapped, recipientSep) {
 		blob, err := b64.DecodeString(part)
 		if err != nil {
@@ -451,14 +494,13 @@ func (kr *Keyring) Unwrap(dekID, wrapped string) (*DEK, error) {
 		}
 		header := blob[:blobHeader]
 		if !bytes.Equal(header[3:9], k.pub.suite.bytes()) {
-			return nil, fmt.Errorf("wrapped key suite does not match key %s", kid)
+			lastErr = fmt.Errorf("wrapped key suite does not match key %s", kid)
+			continue
 		}
 		key, err := hpke.Open(k.sk, k.pub.kdf, k.pub.aead, wrapInfo(header), blob[blobHeader:])
-		if err != nil {
-			return nil, fmt.Errorf("unwrapping key with %s: %w", kid, ErrAuthentication)
-		}
-		if len(key) != dekSize {
-			return nil, errors.New("unexpected data encryption key size")
+		if err != nil || len(key) != dekSize {
+			lastErr = fmt.Errorf("unwrapping key with %s: %w", kid, ErrAuthentication)
+			continue
 		}
 		aead, err := newDEKCipher(key)
 		if err != nil {
@@ -466,5 +508,5 @@ func (kr *Keyring) Unwrap(dekID, wrapped string) (*DEK, error) {
 		}
 		return &DEK{id: dekIDFor(wrapped), wrapped: wrapped, aead: aead, rand: rand.Reader}, nil
 	}
-	return nil, ErrNoMatchingKey
+	return nil, lastErr
 }

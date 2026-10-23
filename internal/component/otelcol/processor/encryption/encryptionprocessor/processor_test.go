@@ -237,6 +237,7 @@ func TestIdempotent(t *testing.T) {
 	require.NoError(t, err)
 	snapshot := once.ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0).Attributes().AsRaw()
 
+	cfg.AcceptEncryptedInput = true
 	twice, reader, err := runTraces(t, cfg, once)
 	require.NoError(t, err)
 	require.Equal(t, snapshot, twice.ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0).Attributes().AsRaw())
@@ -343,7 +344,7 @@ func TestConfigValidate(t *testing.T) {
 		"unknown preset":  {mutate: func(c *Config) { c.Rules[0].Presets = []string{"pii"} }, err: "unknown preset"},
 		"bad pattern":     {mutate: func(c *Config) { c.Rules[0].AttributePatterns = []string{"("} }, err: "invalid attribute pattern"},
 		"events w/o body": {mutate: func(c *Config) { c.Rules[0].LogBodyEventNames = []string{"x"} }, err: "requires log_body"},
-		"too many values": {mutate: func(c *Config) { c.KeyRotation.MaxValues = 1 << 33 }, err: "2^32"},
+		"too many values": {mutate: func(c *Config) { c.KeyRotation.MaxValues = 1 << 33 }, err: "2^31"},
 		"duplicate names": {mutate: func(c *Config) {
 			c.Rules = []RuleConfig{{Name: "a", Recipients: []string{key}, LogBody: true}, {Name: "a", Recipients: []string{key}, LogBody: true}}
 		}, err: "duplicate name"},

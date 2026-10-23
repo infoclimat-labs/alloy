@@ -21,11 +21,12 @@ var allSuites = []Suite{
 }
 
 var testCtx = Context{
-	Signal:  "traces",
-	Scope:   "span",
-	Key:     "gen_ai.input.messages",
-	TraceID: bytes.Repeat([]byte{0xab}, 16),
-	SpanID:  bytes.Repeat([]byte{0xcd}, 8),
+	Signal:   "traces",
+	Scope:    "span",
+	Key:      "gen_ai.input.messages",
+	RecordID: bytes.Repeat([]byte{0xef}, 16),
+	TraceID:  bytes.Repeat([]byte{0xab}, 16),
+	SpanID:   bytes.Repeat([]byte{0xcd}, 8),
 }
 
 func mustKey(t testing.TB, s Suite) *PrivateKey {
@@ -54,7 +55,7 @@ func TestRoundTripAllSuites(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			pt := EncodeString(`[{"role":"user","parts":[{"type":"text","content":"Bonjour"}]}]`)
+			pt := EncodeString("k", `[{"role":"user","parts":[{"type":"text","content":"Bonjour"}]}]`)
 			tok, err := dek.Seal(pt, testCtx)
 			if err != nil {
 				t.Fatal(err)
@@ -138,7 +139,7 @@ func TestContextBinding(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tok, err := dek.Seal(EncodeString("secret"), testCtx)
+	tok, err := dek.Seal(EncodeString("k", "secret"), testCtx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -153,6 +154,8 @@ func TestContextBinding(t *testing.T) {
 		"signal":  func(c *Context) { c.Signal = "logs" },
 		"trace":   func(c *Context) { c.TraceID = bytes.Repeat([]byte{1}, 16) },
 		"span":    func(c *Context) { c.SpanID = nil },
+		"record":  func(c *Context) { c.RecordID = bytes.Repeat([]byte{1}, 16) },
+		"event":   func(c *Context) { c.Position = "1/gen_ai.choice" },
 		"shifted": func(c *Context) { c.Key, c.Scope = "", "span"+c.Key },
 	}
 	for name, mutate := range mutations {
@@ -172,7 +175,7 @@ func TestNormalizedKeyBinding(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tok, err := dek.Seal(EncodeString("secret"), testCtx)
+	tok, err := dek.Seal(EncodeString("k", "secret"), testCtx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -196,7 +199,7 @@ func TestTamperedToken(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tok, err := dek.Seal(EncodeString("secret"), testCtx)
+	tok, err := dek.Seal(EncodeString("k", "secret"), testCtx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -219,7 +222,7 @@ func TestTamperedToken(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tok2, err := other.Seal(EncodeString("secret"), testCtx)
+	tok2, err := other.Seal(EncodeString("k", "secret"), testCtx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -279,7 +282,7 @@ func TestMultipleRecipients(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tok, err := dek.Seal(EncodeString("for both"), testCtx)
+	tok, err := dek.Seal(EncodeString("k", "for both"), testCtx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -324,7 +327,7 @@ func TestRotation(t *testing.T) {
 		if d != first {
 			t.Fatal("rotated before reaching the use limit")
 		}
-		if _, err := d.Seal(EncodeString("x"), testCtx); err != nil {
+		if _, err := d.Seal(EncodeString("k", "x"), testCtx); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -362,7 +365,7 @@ func TestConcurrentSealing(t *testing.T) {
 					t.Error(err)
 					return
 				}
-				tok, err := d.Seal(EncodeString("v"), testCtx)
+				tok, err := d.Seal(EncodeString("k", "v"), testCtx)
 				if err != nil {
 					t.Error(err)
 					return
@@ -394,26 +397,63 @@ func TestConcurrentSealing(t *testing.T) {
 }
 
 func TestValueEncoding(t *testing.T) {
-	kind, payload, err := DecodeValue(EncodeString("héllo"))
-	if err != nil || kind != KindString || string(payload) != "héllo" {
-		t.Fatalf("string: %q %q %v", kind, payload, err)
+	v, err := DecodeValue(EncodeString("gen_ai.prompt", "héllo"))
+	if err != nil || v.Kind != KindString || v.Key != "gen_ai.prompt" || string(v.Payload) != "héllo" {
+		t.Fatalf("string: %+v %v", v, err)
 	}
-	enc, err := EncodeJSON([]byte(`{"a":[1,2]}`))
+	enc, err := EncodeJSON("args", []byte(`{"a":[1,2]}`))
 	if err != nil {
 		t.Fatal(err)
 	}
-	kind, payload, err = DecodeValue(enc)
-	if err != nil || kind != KindJSON || string(payload) != `{"a":[1,2]}` {
-		t.Fatalf("json: %q %q %v", kind, payload, err)
+	v, err = DecodeValue(enc)
+	if err != nil || v.Kind != KindJSON || v.Key != "args" || string(v.Payload) != `{"a":[1,2]}` {
+		t.Fatalf("json: %+v %v", v, err)
 	}
-	if _, err := EncodeJSON([]byte("{")); err == nil {
+	if err := v.CheckKey("args", true); err != nil {
+		t.Fatal(err)
+	}
+	if err := v.CheckKey("other", true); err == nil {
+		t.Fatal("key mismatch not detected")
+	}
+	enc, _ = EncodeValue(KindString, "gen_ai.input.messages", nil)
+	v, _ = DecodeValue(enc)
+	if v.CheckKey("gen_ai_input_messages", false) != nil || v.CheckKey("gen_ai_input_messages", true) == nil {
+		t.Fatal("normalized key check")
+	}
+	if _, err := EncodeJSON("k", []byte("{")); err == nil {
 		t.Fatal("invalid JSON accepted")
 	}
-	if _, _, err := DecodeValue([]byte("x")); err == nil {
-		t.Fatal("unknown kind accepted")
+	for _, bad := range [][]byte{nil, []byte("x"), {KindString}, {KindString, 10, 'a'}} {
+		if _, err := DecodeValue(bad); err == nil {
+			t.Fatalf("malformed plaintext %q accepted", bad)
+		}
 	}
-	if _, _, err := DecodeValue(nil); err == nil {
-		t.Fatal("empty plaintext accepted")
+}
+
+func TestSealLimit(t *testing.T) {
+	var c counter
+	c.n = MaxSealsPerDEK - 1
+	if !c.TryAdd(MaxSealsPerDEK) || c.TryAdd(MaxSealsPerDEK) {
+		t.Fatal("hard seal limit not enforced")
+	}
+	priv := mustKey(t, Suite{KEM: KEMX25519HKDFSHA256, KDF: KDFHKDFSHA256, AEAD: AEADAES256GCM})
+	d, _ := mustSealer(t, SealerOptions{}, priv.Public()).Current()
+	d.uses.n = MaxSealsPerDEK
+	if _, err := d.Seal(EncodeString("k", "x"), testCtx); !errors.Is(err, ErrDEKExhausted) {
+		t.Fatalf("want ErrDEKExhausted, got %v", err)
+	}
+}
+
+func TestUnwrapTriesEveryMatchingBlob(t *testing.T) {
+	priv := mustKey(t, Suite{KEM: KEMX25519HKDFSHA256, KDF: KDFHKDFSHA256, AEAD: AEADAES256GCM})
+	d, _ := mustSealer(t, SealerOptions{}, priv.Public()).Current()
+	// A bogus blob for the same key ID placed before the genuine one.
+	blob, _ := b64.DecodeString(d.WrappedKey())
+	bogus := append([]byte(nil), blob...)
+	bogus[len(bogus)-1] ^= 1
+	wrapped := b64.EncodeToString(bogus) + "." + d.WrappedKey()
+	if _, err := NewKeyring(priv).Unwrap("", wrapped); err != nil {
+		t.Fatalf("genuine blob hidden by a bogus one: %v", err)
 	}
 }
 
@@ -423,7 +463,7 @@ func FuzzOpen(f *testing.F) {
 	if err != nil {
 		f.Fatal(err)
 	}
-	tok, _ := dek.Seal(EncodeString("seed"), testCtx)
+	tok, _ := dek.Seal(EncodeString("k", "seed"), testCtx)
 	f.Add(tok)
 	f.Add("enc:v1:")
 	f.Add(dek.WrappedKey())
@@ -442,7 +482,7 @@ func BenchmarkSeal(b *testing.B) {
 		b.Fatal(err)
 	}
 	for _, size := range []int{256, 4096, 65536} {
-		pt := EncodeString(strings.Repeat("a", size))
+		pt := EncodeString("k", strings.Repeat("a", size))
 		b.Run(byteSize(size), func(b *testing.B) {
 			b.SetBytes(int64(len(pt)))
 			b.ReportAllocs()

@@ -23,10 +23,15 @@ services:
         for k in business technical escrow; do
           [ -f "/private/$$k.key" ] || otelcrypt keygen -private "/private/$$k.key" -public "/public/$$k.pub"
         done
+        # Alloy's record signing key: only Alloy holds the private half,
+        # auditors pin the public half.
+        [ -f /alloy-secrets/signing.key ] || otelcrypt keygen -signing -private /alloy-secrets/signing.key -public /public/alloy-signing.pub
         chmod 0644 /public/*.pub
+        chmod 0600 /alloy-secrets/signing.key
     volumes:
       - private-keys:/private
       - public-keys:/public
+      - alloy-secrets:/alloy-secrets
 
   alloy:
     build:
@@ -47,8 +52,10 @@ services:
       - "4318:4318"
     volumes:
       - ./config.alloy:/etc/alloy/config.alloy:ro
-      # Only the public keys are mounted into Alloy.
+      # Only the public keys, and Alloy's own signing key, are mounted into
+      # Alloy: it can encrypt and sign, never decrypt.
       - public-keys:/keys:ro
+      - alloy-secrets:/secrets:ro
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://127.0.0.1:12345/-/ready"]
       interval: 5s
@@ -97,9 +104,11 @@ services:
     entrypoint: ["/bin/sh"]
     volumes:
       - private-keys:/keys:ro
+      - public-keys:/public:ro
       - ./decrypt.sh:/demo/decrypt.sh:ro
       - ./audit:/audit
 
 volumes:
   private-keys:
   public-keys:
+  alloy-secrets:

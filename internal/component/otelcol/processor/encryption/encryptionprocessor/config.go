@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"go.opentelemetry.io/collector/component"
+	"go.opentelemetry.io/collector/config/configopaque"
 
 	"github.com/grafana/alloy/internal/component/otelcol/processor/encryption/encryptionprocessor/envelope"
 )
@@ -35,6 +36,20 @@ type Config struct {
 	// KeyRotation controls how often data encryption keys are renewed.
 	KeyRotation KeyRotationConfig `mapstructure:"key_rotation"`
 
+	// SigningKey is an optional PEM encoded signing key. When set, every
+	// record carrying encrypted values is signed, so that a decryptor
+	// pinning the verification key detects forged, moved, altered or
+	// deleted values.
+	SigningKey configopaque.String `mapstructure:"signing_key"`
+
+	// AcceptEncryptedInput keeps values that are already encrypted, for
+	// example by another Alloy tier, instead of encrypting them again. A
+	// value is only kept when it is a well-formed token whose wrapped key is
+	// present on the record. When false (the default), incoming encryption
+	// attributes are removed and token-like values are encrypted like any
+	// other value, so a client can't smuggle clear text past the processor.
+	AcceptEncryptedInput bool `mapstructure:"accept_encrypted_input"`
+
 	_ struct{}
 }
 
@@ -57,7 +72,7 @@ type RuleConfig struct {
 	Recipients []string `mapstructure:"recipients"`
 
 	// Presets add well-known attribute sets. Supported: "gen_ai",
-	// "openinference".
+	// "openinference", "exceptions".
 	Presets []string `mapstructure:"presets"`
 
 	// Attributes are exact attribute keys to encrypt.
@@ -98,11 +113,15 @@ func (cfg *Config) Validate() error {
 	default:
 		return fmt.Errorf("on_error must be %q or %q, got %q", OnErrorDelete, OnErrorReject, cfg.OnError)
 	}
-	if cfg.KeyRotation.MaxValues > 1<<32 {
-		return errors.New("key_rotation.max_values must not exceed 2^32 (AES-GCM random nonce limit)")
+	if cfg.KeyRotation.MaxValues > 1<<31 {
+		return errors.New("key_rotation.max_values must not exceed 2^31 (AES-GCM random nonce limit)")
 	}
 	if cfg.KeyRotation.MaxAge < 0 {
 		return errors.New("key_rotation.max_age must not be negative")
+	}
+
+	if _, err := cfg.signingKey(); err != nil {
+		return fmt.Errorf("signing_key: %w", err)
 	}
 
 	names := make(map[string]bool, len(cfg.Rules))
@@ -171,4 +190,11 @@ func (r *RuleConfig) publicKeys() ([]*envelope.PublicKey, error) {
 		keys = append(keys, k)
 	}
 	return keys, nil
+}
+
+func (cfg *Config) signingKey() (*envelope.SigningKey, error) {
+	if cfg.SigningKey == "" {
+		return nil, nil
+	}
+	return envelope.ParseSigningKey([]byte(cfg.SigningKey))
 }

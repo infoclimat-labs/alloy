@@ -2,6 +2,7 @@ package encryption_test
 
 import (
 	"context"
+	"encoding/hex"
 	"strings"
 	"testing"
 	"time"
@@ -32,8 +33,12 @@ func alloyString(s string) string { return "`" + s + "`" }
 
 func TestArguments_UnmarshalAlloy(t *testing.T) {
 	_, pub := publicKey(t)
+	sk, err := envelope.GenerateSigningKey(envelope.SigEd25519)
+	require.NoError(t, err)
 	cfg := `
 		on_error = "reject"
+		signing_key = ` + alloyString(string(sk.MarshalPEM())) + `
+		accept_encrypted_input = true
 
 		key_rotation {
 			max_values = 1000
@@ -64,6 +69,8 @@ func TestArguments_UnmarshalAlloy(t *testing.T) {
 	require.NoError(t, err)
 	c := converted.(*encryptionprocessor.Config)
 	require.Equal(t, encryptionprocessor.OnErrorReject, c.OnError)
+	require.Equal(t, string(sk.MarshalPEM()), string(c.SigningKey))
+	require.True(t, c.AcceptEncryptedInput)
 	require.Equal(t, uint64(1000), c.KeyRotation.MaxValues)
 	require.Equal(t, time.Minute, c.KeyRotation.MaxAge)
 	require.Len(t, c.Rules, 2)
@@ -210,10 +217,14 @@ func TestPipeline(t *testing.T) {
 		})
 		dek, err := envelope.NewKeyring(priv).Unwrap(dekID, wrapped)
 		require.NoError(t, err)
-		traceID, spanID := [16]byte{1}, [8]byte{2}
-		pt, err := dek.Open(v.Str(), envelope.Context{Signal: "traces", Scope: "span", Key: "gen_ai.input.messages", TraceID: traceID[:], SpanID: spanID[:]})
+		ridAttr, ok := attrs.Get(envelope.RecordIDAttr)
+		require.True(t, ok)
+		rid, err := hex.DecodeString(ridAttr.Str())
 		require.NoError(t, err)
-		require.Equal(t, envelope.EncodeString("secret prompt"), pt)
+		traceID, spanID := [16]byte{1}, [8]byte{2}
+		pt, err := dek.Open(v.Str(), envelope.Context{Signal: "traces", Scope: "span", Key: "gen_ai.input.messages", RecordID: rid, TraceID: traceID[:], SpanID: spanID[:]})
+		require.NoError(t, err)
+		require.Equal(t, envelope.EncodeString("gen_ai.input.messages", "secret prompt"), pt)
 	case <-time.After(5 * time.Second):
 		t.Fatal("no output received")
 	}

@@ -4,6 +4,10 @@ server:
   http_listen_port: 3200
 
 distributor:
+  # Tempo truncates attribute values to 2048 bytes by default, which corrupts
+  # ciphertexts and wrapped keys (a post-quantum wrapped key is ~1.6 KB per
+  # recipient). Disable the limit, or raise it above your largest value.
+  max_attribute_bytes: 0
   receivers:
     otlp:
       protocols:

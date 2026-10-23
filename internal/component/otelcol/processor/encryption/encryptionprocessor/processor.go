@@ -2,12 +2,15 @@ package encryptionprocessor
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"regexp"
-	"slices"
+	"strconv"
 	"strings"
+	"sync"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
@@ -23,6 +26,7 @@ import (
 const (
 	scopeSpan      = "span"
 	scopeSpanEvent = "span_event"
+	scopeSpanLink  = "span_link"
 	scopeLog       = "log"
 	scopeLogBody   = "log_body"
 
@@ -30,43 +34,64 @@ const (
 	signalLogs   = "logs"
 
 	eventNameAttr = "event.name"
+	recordIDSize  = 16
+	maxMatchCache = 4096
 )
 
 type rule struct {
 	name       string
 	sealer     *envelope.Sealer
+	exact      map[string]bool
+	patterns   []*regexp.Regexp
 	logBody    bool
 	bodyEvents map[string]bool
 
 	attrs metric.MeasurementOption
 }
 
-type encryptor struct {
-	logger  *zap.Logger
-	onError OnError
+func (r *rule) matches(key string) bool {
+	if r.exact[key] {
+		return true
+	}
+	for _, re := range r.patterns {
+		if re.MatchString(key) {
+			return true
+		}
+	}
+	return false
+}
 
-	rules    []*rule
-	exact    map[string]*rule
-	patterns []patternRule
+type encryptor struct {
+	logger      *zap.Logger
+	onError     OnError
+	acceptInput bool
+	signer      *envelope.SigningKey
+
+	rules []*rule
+
+	// cache memoizes the rule matching an attribute key (nil for none).
+	cacheMu sync.RWMutex
+	cache   map[string]*rule
 
 	valuesEncrypted metric.Int64Counter
 	bytesEncrypted  metric.Int64Counter
 	failures        metric.Int64Counter
-}
-
-type patternRule struct {
-	re   *regexp.Regexp
-	rule *rule
+	recordsSigned   metric.Int64Counter
 }
 
 func newEncryptor(cfg *Config, logger *zap.Logger, meter metric.Meter) (*encryptor, error) {
 	e := &encryptor{
-		logger:  logger,
-		onError: cfg.OnError,
-		exact:   map[string]*rule{},
+		logger:      logger,
+		onError:     cfg.OnError,
+		acceptInput: cfg.AcceptEncryptedInput,
+		cache:       map[string]*rule{},
 	}
 	if e.onError == "" {
 		e.onError = OnErrorDelete
+	}
+	var err error
+	if e.signer, err = cfg.signingKey(); err != nil {
+		return nil, fmt.Errorf("signing_key: %w", err)
 	}
 
 	opts := envelope.SealerOptions{MaxUses: cfg.KeyRotation.MaxValues, MaxAge: cfg.KeyRotation.MaxAge}
@@ -87,6 +112,7 @@ func newEncryptor(cfg *Config, logger *zap.Logger, meter metric.Meter) (*encrypt
 		r := &rule{
 			name:    name,
 			sealer:  sealer,
+			exact:   map[string]bool{},
 			logBody: rc.LogBody,
 			attrs:   metric.WithAttributeSet(attribute.NewSet(attribute.String("rule", name))),
 		}
@@ -96,25 +122,22 @@ func newEncryptor(cfg *Config, logger *zap.Logger, meter metric.Meter) (*encrypt
 				r.bodyEvents[n] = true
 			}
 		}
-		e.rules = append(e.rules, r)
-
-		attrs, patterns := slices.Clone(rc.Attributes), slices.Clone(rc.AttributePatterns)
+		attrs, patterns := append([]string(nil), rc.Attributes...), append([]string(nil), rc.AttributePatterns...)
 		for _, p := range rc.Presets {
 			attrs = append(attrs, presets[p].attributes...)
 			patterns = append(patterns, presets[p].patterns...)
 		}
 		for _, a := range attrs {
-			if _, taken := e.exact[a]; !taken {
-				e.exact[a] = r
-			}
+			r.exact[a] = true
 		}
 		for _, p := range patterns {
 			re, err := regexp.Compile(p)
 			if err != nil {
 				return nil, fmt.Errorf("rule %q: %w", name, err)
 			}
-			e.patterns = append(e.patterns, patternRule{re: re, rule: r})
+			r.patterns = append(r.patterns, re)
 		}
+		e.rules = append(e.rules, r)
 		logger.Info("encryption rule configured",
 			zap.String("rule", name),
 			zap.Strings("recipients", sealer.Recipients()),
@@ -122,53 +145,113 @@ func newEncryptor(cfg *Config, logger *zap.Logger, meter metric.Meter) (*encrypt
 			zap.Int("attribute_patterns", len(patterns)),
 			zap.Bool("log_body", rc.LogBody))
 	}
+	if e.signer != nil {
+		logger.Info("records are signed", zap.String("key_id", e.signer.KeyID()), zap.String("algorithm", e.signer.Public().Algorithm()))
+	}
 
-	var err error
-	if e.valuesEncrypted, err = meter.Int64Counter(
-		"otelcol_processor_encryption_values_encrypted",
-		metric.WithDescription("Number of attribute values and log bodies encrypted."),
-		metric.WithUnit("{value}"),
-	); err != nil {
-		return nil, err
-	}
-	if e.bytesEncrypted, err = meter.Int64Counter(
-		"otelcol_processor_encryption_plaintext_bytes",
-		metric.WithDescription("Number of plaintext bytes encrypted."),
-		metric.WithUnit("By"),
-	); err != nil {
-		return nil, err
-	}
-	if e.failures, err = meter.Int64Counter(
-		"otelcol_processor_encryption_failures",
-		metric.WithDescription("Number of values that could not be encrypted."),
-		metric.WithUnit("{value}"),
-	); err != nil {
-		return nil, err
+	for _, c := range []struct {
+		dst        *metric.Int64Counter
+		name, desc string
+		unit       string
+	}{
+		{&e.valuesEncrypted, "otelcol_processor_encryption_values_encrypted", "Number of attribute values and log bodies encrypted.", "{value}"},
+		{&e.bytesEncrypted, "otelcol_processor_encryption_plaintext_bytes", "Number of plaintext bytes encrypted.", "By"},
+		{&e.failures, "otelcol_processor_encryption_failures", "Number of values that could not be encrypted.", "{value}"},
+		{&e.recordsSigned, "otelcol_processor_encryption_records_signed", "Number of records signed.", "{record}"},
+	} {
+		if *c.dst, err = meter.Int64Counter(c.name, metric.WithDescription(c.desc), metric.WithUnit(c.unit)); err != nil {
+			return nil, err
+		}
 	}
 	return e, nil
 }
 
-// match returns the rule encrypting the attribute key, if any.
+// match returns the rule encrypting the attribute key, if any. Rules are
+// evaluated in configuration order: the first rule that selects the key, by
+// exact name, preset or pattern, wins.
 func (e *encryptor) match(key string) *rule {
-	if r, ok := e.exact[key]; ok {
+	e.cacheMu.RLock()
+	r, ok := e.cache[key]
+	e.cacheMu.RUnlock()
+	if ok {
 		return r
 	}
-	for _, p := range e.patterns {
-		if p.re.MatchString(key) {
-			return p.rule
+	for _, candidate := range e.rules {
+		if candidate.matches(key) {
+			r = candidate
+			break
 		}
 	}
-	return nil
+	e.cacheMu.Lock()
+	if len(e.cache) < maxMatchCache {
+		e.cache[key] = r
+	}
+	e.cacheMu.Unlock()
+	return r
 }
 
-// record tracks the data encryption keys used for one span or log record, so
-// that every value of the record under the same rule shares one wrapped key.
+// record holds the state of one span or log record being encrypted.
 type record struct {
-	deks map[*rule]*envelope.DEK
+	e      *encryptor
+	signal string
+	// attrs are the attributes of the span or log record, where the record
+	// ID, wrapped keys and signature are stored.
+	attrs   pcommon.Map
+	rid     []byte
+	traceID []byte
+	spanID  []byte
+	deks    map[*rule]*envelope.DEK
+	// wrapped holds every wrapped key referenced by the record, including
+	// accepted upstream ones.
+	wrapped map[string]string
+	entries []envelope.Entry
+}
+
+func (e *encryptor) newRecord(signal string, attrs pcommon.Map, traceID, spanID []byte) *record {
+	rec := &record{e: e, signal: signal, attrs: attrs, traceID: traceID, spanID: spanID}
+	if !e.acceptInput {
+		// Never trust encryption metadata coming from clients.
+		attrs.RemoveIf(func(k string, _ pcommon.Value) bool { return strings.HasPrefix(k, envelope.AttrPrefix) })
+		return rec
+	}
+	if v, ok := attrs.Get(envelope.RecordIDAttr); ok && v.Type() == pcommon.ValueTypeStr {
+		if rid, err := hex.DecodeString(v.Str()); err == nil && len(rid) == recordIDSize {
+			rec.rid = rid
+		}
+	}
+	attrs.Range(func(k string, v pcommon.Value) bool {
+		if id, ok := strings.CutPrefix(k, envelope.WrappedKeyAttrPrefix); ok && v.Type() == pcommon.ValueTypeStr {
+			if rec.wrapped == nil {
+				rec.wrapped = map[string]string{}
+			}
+			rec.wrapped[id] = v.Str()
+		}
+		return true
+	})
+	attrs.Remove(envelope.SignatureAttr)
+	return rec
+}
+
+func (rec *record) context(scope, position, key string) (envelope.Context, error) {
+	if rec.rid == nil {
+		rec.rid = make([]byte, recordIDSize)
+		if _, err := rand.Read(rec.rid); err != nil {
+			return envelope.Context{}, err
+		}
+	}
+	return envelope.Context{
+		Signal:   rec.signal,
+		Scope:    scope,
+		Position: position,
+		Key:      key,
+		RecordID: rec.rid,
+		TraceID:  rec.traceID,
+		SpanID:   rec.spanID,
+	}, nil
 }
 
 func (rec *record) dek(r *rule) (*envelope.DEK, error) {
-	if d, ok := rec.deks[r]; ok {
+	if d, ok := rec.deks[r]; ok && d.Uses() < r.sealer.MaxUses() {
 		return d, nil
 	}
 	d, err := r.sealer.Current()
@@ -179,36 +262,55 @@ func (rec *record) dek(r *rule) (*envelope.DEK, error) {
 		rec.deks = make(map[*rule]*envelope.DEK, 1)
 	}
 	rec.deks[r] = d
+	if rec.wrapped == nil {
+		rec.wrapped = map[string]string{}
+	}
+	rec.wrapped[d.ID()] = d.WrappedKey()
 	return d, nil
 }
 
-// finish attaches the wrapped keys to the record attributes.
-func (rec *record) finish(attrs pcommon.Map) {
-	for _, d := range rec.deks {
-		attrs.PutStr(d.AttributeKey(), d.WrappedKey())
+// accepted reports whether an incoming value is a token to keep as is.
+func (rec *record) accepted(v pcommon.Value) bool {
+	if !rec.e.acceptInput || v.Type() != pcommon.ValueTypeStr {
+		return false
 	}
-}
-
-func encodeValue(v pcommon.Value) ([]byte, error) {
-	if v.Type() == pcommon.ValueTypeStr {
-		return envelope.EncodeString(v.Str()), nil
-	}
-	raw, err := json.Marshal(v.AsRaw())
+	id, _, err := envelope.ParseToken(v.Str())
 	if err != nil {
-		return nil, err
+		return false
 	}
-	return envelope.EncodeJSON(raw)
+	_, ok := rec.wrapped[id]
+	return ok
 }
 
-func (e *encryptor) seal(ctx context.Context, rec *record, r *rule, v pcommon.Value, c envelope.Context) error {
+func encodeValue(key string, v pcommon.Value) ([]byte, error) {
+	switch v.Type() {
+	case pcommon.ValueTypeStr:
+		return envelope.EncodeValue(envelope.KindString, key, []byte(v.Str()))
+	case pcommon.ValueTypeBytes:
+		return envelope.EncodeValue(envelope.KindBytes, key, v.Bytes().AsRaw())
+	default:
+		raw, err := json.Marshal(v.AsRaw())
+		if err != nil {
+			return nil, err
+		}
+		return envelope.EncodeValue(envelope.KindJSON, key, raw)
+	}
+}
+
+// seal encrypts v in place.
+func (rec *record) seal(ctx context.Context, r *rule, v pcommon.Value, scope, position, key string) error {
 	if v.Type() == pcommon.ValueTypeEmpty {
 		return nil
 	}
-	if v.Type() == pcommon.ValueTypeStr && envelope.IsToken(v.Str()) {
-		// Already encrypted, for example by an upstream Alloy instance.
+	if rec.accepted(v) {
+		rec.entries = append(rec.entries, envelope.Entry{Scope: scope, Position: position, Key: key, Token: v.Str()})
 		return nil
 	}
-	pt, err := encodeValue(v)
+	pt, err := encodeValue(key, v)
+	if err != nil {
+		return err
+	}
+	c, err := rec.context(scope, position, key)
 	if err != nil {
 		return err
 	}
@@ -221,42 +323,41 @@ func (e *encryptor) seal(ctx context.Context, rec *record, r *rule, v pcommon.Va
 		return err
 	}
 	v.SetStr(tok)
-	e.valuesEncrypted.Add(ctx, 1, r.attrs)
-	e.bytesEncrypted.Add(ctx, int64(len(pt)-1), r.attrs)
+	rec.entries = append(rec.entries, envelope.Entry{Scope: scope, Position: position, Key: key, Token: tok})
+	rec.e.valuesEncrypted.Add(ctx, 1, r.attrs)
+	rec.e.bytesEncrypted.Add(ctx, int64(len(pt)), r.attrs)
 	return nil
 }
 
-func (e *encryptor) fail(ctx context.Context, r *rule, c envelope.Context, err error) error {
+func (e *encryptor) fail(ctx context.Context, r *rule, scope, key string, err error) error {
 	e.failures.Add(ctx, 1, r.attrs)
 	// Never log the value itself.
 	e.logger.Warn("failed to encrypt value",
 		zap.String("rule", r.name),
-		zap.String("scope", c.Scope),
-		zap.String("key", c.Key),
+		zap.String("scope", scope),
+		zap.String("key", key),
 		zap.String("on_error", string(e.onError)),
 		zap.Error(err))
 	if e.onError == OnErrorReject {
-		return fmt.Errorf("encrypting %s %q: %w", c.Scope, c.Key, err)
+		return fmt.Errorf("encrypting %s %q: %w", scope, key, err)
 	}
 	return nil
 }
 
 // processAttributes encrypts the matching attributes of attrs.
-func (e *encryptor) processAttributes(ctx context.Context, rec *record, attrs pcommon.Map, base envelope.Context) error {
+func (rec *record) processAttributes(ctx context.Context, attrs pcommon.Map, scope, position string) error {
 	var failed []string
 	var rejectErr error
 	attrs.Range(func(k string, v pcommon.Value) bool {
-		if strings.HasPrefix(k, envelope.WrappedKeyAttrPrefix) {
+		if strings.HasPrefix(k, envelope.AttrPrefix) {
 			return true
 		}
-		r := e.match(k)
+		r := rec.e.match(k)
 		if r == nil {
 			return true
 		}
-		c := base
-		c.Key = k
-		if err := e.seal(ctx, rec, r, v, c); err != nil {
-			if rejectErr = e.fail(ctx, r, c, err); rejectErr != nil {
+		if err := rec.seal(ctx, r, v, scope, position, k); err != nil {
+			if rejectErr = rec.e.fail(ctx, r, scope, k, err); rejectErr != nil {
 				return false
 			}
 			failed = append(failed, k)
@@ -269,6 +370,44 @@ func (e *encryptor) processAttributes(ctx context.Context, rec *record, attrs pc
 	for _, k := range failed {
 		attrs.Remove(k)
 	}
+	return nil
+}
+
+// finish attaches the record ID, wrapped keys and signature.
+func (rec *record) finish(ctx context.Context) error {
+	if len(rec.entries) == 0 {
+		return nil
+	}
+	rec.attrs.PutStr(envelope.RecordIDAttr, hex.EncodeToString(rec.rid))
+	used := map[string]string{}
+	for _, entry := range rec.entries {
+		id, _, err := envelope.ParseToken(entry.Token)
+		if err != nil {
+			continue
+		}
+		if w, ok := rec.wrapped[id]; ok {
+			used[id] = w
+		}
+	}
+	for id, w := range used {
+		rec.attrs.PutStr(envelope.WrappedKeyAttrPrefix+id, w)
+	}
+	if rec.e.signer == nil {
+		return nil
+	}
+	sig, err := rec.e.signer.Sign(envelope.Manifest{
+		Signal:      rec.signal,
+		RecordID:    rec.rid,
+		TraceID:     rec.traceID,
+		SpanID:      rec.spanID,
+		Entries:     rec.entries,
+		WrappedKeys: used,
+	})
+	if err != nil {
+		return fmt.Errorf("signing record: %w", err)
+	}
+	rec.attrs.PutStr(envelope.SignatureAttr, sig)
+	rec.e.recordsSigned.Add(ctx, 1)
 	return nil
 }
 
@@ -295,27 +434,32 @@ func (e *encryptor) processTraces(ctx context.Context, td ptrace.Traces) (ptrace
 	return td, nil
 }
 
+// position identifies an event or link inside its span.
+func position(i int, name string) string {
+	return strconv.Itoa(i) + "/" + name
+}
+
 func (e *encryptor) processSpan(ctx context.Context, span ptrace.Span) error {
 	traceID, spanID := span.TraceID(), span.SpanID()
-	base := envelope.Context{
-		Signal:  signalTraces,
-		Scope:   scopeSpan,
-		TraceID: idBytes(traceID, traceID[:]),
-		SpanID:  idBytes(spanID, spanID[:]),
-	}
-	var rec record
-	if err := e.processAttributes(ctx, &rec, span.Attributes(), base); err != nil {
+	rec := e.newRecord(signalTraces, span.Attributes(), idBytes(traceID, traceID[:]), idBytes(spanID, spanID[:]))
+	if err := rec.processAttributes(ctx, span.Attributes(), scopeSpan, ""); err != nil {
 		return err
 	}
-	base.Scope = scopeSpanEvent
 	events := span.Events()
 	for i := 0; i < events.Len(); i++ {
-		if err := e.processAttributes(ctx, &rec, events.At(i).Attributes(), base); err != nil {
+		ev := events.At(i)
+		if err := rec.processAttributes(ctx, ev.Attributes(), scopeSpanEvent, position(i, ev.Name())); err != nil {
 			return err
 		}
 	}
-	rec.finish(span.Attributes())
-	return nil
+	links := span.Links()
+	for i := 0; i < links.Len(); i++ {
+		link := links.At(i)
+		if err := rec.processAttributes(ctx, link.Attributes(), scopeSpanLink, position(i, link.SpanID().String())); err != nil {
+			return err
+		}
+	}
+	return rec.finish(ctx)
 }
 
 func (e *encryptor) processLogs(ctx context.Context, ld plog.Logs) (plog.Logs, error) {
@@ -334,59 +478,60 @@ func (e *encryptor) processLogs(ctx context.Context, ld plog.Logs) (plog.Logs, e
 	return ld, nil
 }
 
-func eventName(lr plog.LogRecord) string {
+// eventName returns the event name of a log record, and whether it can be
+// trusted. A name that is itself encrypted can't be matched.
+func eventName(lr plog.LogRecord) (string, bool) {
 	if n := lr.EventName(); n != "" {
-		return n
+		return n, !envelope.IsToken(n)
 	}
-	if v, ok := lr.Attributes().Get(eventNameAttr); ok && v.Type() == pcommon.ValueTypeStr {
-		return v.Str()
+	if v, ok := lr.Attributes().Get(eventNameAttr); ok {
+		if v.Type() != pcommon.ValueTypeStr || envelope.IsToken(v.Str()) {
+			return "", false
+		}
+		return v.Str(), true
 	}
-	return ""
+	return "", true
 }
 
 func (e *encryptor) processLog(ctx context.Context, lr plog.LogRecord) error {
+	// Select the body rule before attributes are encrypted: a rule may
+	// encrypt event.name, which must not turn body encryption off.
+	bodyRule := e.bodyRule(lr)
+
 	traceID, spanID := lr.TraceID(), lr.SpanID()
-	base := envelope.Context{
-		Signal:  signalLogs,
-		Scope:   scopeLog,
-		TraceID: idBytes(traceID, traceID[:]),
-		SpanID:  idBytes(spanID, spanID[:]),
-	}
-	var rec record
-	if err := e.processAttributes(ctx, &rec, lr.Attributes(), base); err != nil {
+	rec := e.newRecord(signalLogs, lr.Attributes(), idBytes(traceID, traceID[:]), idBytes(spanID, spanID[:]))
+	if err := rec.processAttributes(ctx, lr.Attributes(), scopeLog, ""); err != nil {
 		return err
 	}
-
-	if r := e.bodyRule(lr); r != nil {
-		c := base
-		c.Scope = scopeLogBody
-		if err := e.seal(ctx, &rec, r, lr.Body(), c); err != nil {
-			if err := e.fail(ctx, r, c, err); err != nil {
+	if bodyRule != nil {
+		if err := rec.seal(ctx, bodyRule, lr.Body(), scopeLogBody, "", ""); err != nil {
+			if err := e.fail(ctx, bodyRule, scopeLogBody, "", err); err != nil {
 				return err
 			}
 			lr.Body().SetStr("")
 		}
 	}
-	rec.finish(lr.Attributes())
-	return nil
+	return rec.finish(ctx)
 }
 
 func (e *encryptor) bodyRule(lr plog.LogRecord) *rule {
-	var name string
-	var nameKnown bool
+	name, trusted := eventName(lr)
+	var first *rule
 	for _, r := range e.rules {
 		if !r.logBody {
 			continue
 		}
-		if r.bodyEvents == nil {
+		if first == nil {
+			first = r
+		}
+		if r.bodyEvents == nil || r.bodyEvents[name] {
 			return r
 		}
-		if !nameKnown {
-			name, nameKnown = eventName(lr), true
-		}
-		if r.bodyEvents[name] {
-			return r
-		}
+	}
+	if !trusted {
+		// The event name is unreadable: fail closed and encrypt the body
+		// with the first rule that encrypts bodies.
+		return first
 	}
 	return nil
 }

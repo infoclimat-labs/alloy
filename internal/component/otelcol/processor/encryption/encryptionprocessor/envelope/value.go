@@ -1,6 +1,7 @@
 package envelope
 
 import (
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,40 +12,90 @@ import (
 const (
 	// KindString marks a UTF-8 string value.
 	KindString byte = 's'
-	// KindJSON marks any other value (map, slice, number, boolean, bytes),
-	// serialized as JSON.
+	// KindJSON marks a map, slice, number or boolean, serialized as JSON.
 	KindJSON byte = 'j'
+	// KindBytes marks a byte slice.
+	KindBytes byte = 'b'
 )
 
+// maxKeyLen bounds the attribute key embedded in a plaintext.
+const maxKeyLen = 4096
+
+// EncodeValue builds the plaintext of a value:
+//
+//	kind (1 byte) | uvarint(len(key)) | key | payload
+//
+// The exact attribute key travels inside the ciphertext. The additional data
+// only binds its normalized form (see NormalizeKey), so that values survive
+// backends that sanitize keys; embedding the exact key lets a decryptor
+// detect a token moved to a different key with the same normalized form.
+func EncodeValue(kind byte, key string, payload []byte) ([]byte, error) {
+	switch kind {
+	case KindString, KindBytes:
+	case KindJSON:
+		if !json.Valid(payload) {
+			return nil, errors.New("invalid JSON value")
+		}
+	default:
+		return nil, fmt.Errorf("unknown value kind %q", kind)
+	}
+	if len(key) > maxKeyLen {
+		return nil, errors.New("attribute key too long")
+	}
+	b := make([]byte, 0, 1+binary.MaxVarintLen64+len(key)+len(payload))
+	b = append(b, kind)
+	b = binary.AppendUvarint(b, uint64(len(key)))
+	b = append(b, key...)
+	return append(b, payload...), nil
+}
+
 // EncodeString prepares a string value for sealing.
-func EncodeString(s string) []byte {
-	b := make([]byte, 1+len(s))
-	b[0] = KindString
-	copy(b[1:], s)
+func EncodeString(key, s string) []byte {
+	b, _ := EncodeValue(KindString, key, []byte(s))
 	return b
 }
 
 // EncodeJSON prepares a non-string value, already serialized as JSON, for
 // sealing.
-func EncodeJSON(raw []byte) ([]byte, error) {
-	if !json.Valid(raw) {
-		return nil, errors.New("invalid JSON value")
-	}
-	b := make([]byte, 1+len(raw))
-	b[0] = KindJSON
-	copy(b[1:], raw)
-	return b, nil
+func EncodeJSON(key string, raw []byte) ([]byte, error) {
+	return EncodeValue(KindJSON, key, raw)
 }
 
-// DecodeValue splits a decrypted plaintext into its kind and payload.
-func DecodeValue(pt []byte) (kind byte, payload []byte, err error) {
+// Value is a decoded plaintext.
+type Value struct {
+	Kind    byte
+	Key     string
+	Payload []byte
+}
+
+// DecodeValue parses a decrypted plaintext.
+func DecodeValue(pt []byte) (Value, error) {
 	if len(pt) == 0 {
-		return 0, nil, errors.New("empty plaintext")
+		return Value{}, errors.New("empty plaintext")
 	}
-	switch pt[0] {
-	case KindString, KindJSON:
-		return pt[0], pt[1:], nil
+	kind := pt[0]
+	switch kind {
+	case KindString, KindJSON, KindBytes:
 	default:
-		return 0, nil, fmt.Errorf("unknown value kind %q", pt[0])
+		return Value{}, fmt.Errorf("unknown value kind %q", kind)
 	}
+	n, sz := binary.Uvarint(pt[1:])
+	if sz <= 0 || n > maxKeyLen || uint64(len(pt)-1-sz) < n {
+		return Value{}, errors.New("malformed plaintext")
+	}
+	start := 1 + sz
+	return Value{Kind: kind, Key: string(pt[start : start+int(n)]), Payload: pt[start+int(n):]}, nil
+}
+
+// CheckKey verifies that the key embedded in a plaintext matches the key the
+// token was found under. When the document went through key sanitization
+// (exact is false), the normalized forms must match.
+func (v Value) CheckKey(key string, exact bool) error {
+	if exact && v.Key != key {
+		return fmt.Errorf("token was encrypted for attribute %q, found under %q", v.Key, key)
+	}
+	if !exact && NormalizeKey(v.Key) != NormalizeKey(key) {
+		return fmt.Errorf("token was encrypted for attribute %q, found under %q", v.Key, key)
+	}
+	return nil
 }

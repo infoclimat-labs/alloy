@@ -18,6 +18,13 @@ local.file "escrow_key" {
   filename = "/keys/escrow.pub"
 }
 
+// Alloy signs every record it encrypts, so auditors can detect forged,
+// moved or deleted values.
+local.file "signing_key" {
+  filename  = "/secrets/signing.key"
+  is_secret = true
+}
+
 otelcol.receiver.otlp "default" {
   grpc {
     endpoint = "0.0.0.0:4317"
@@ -34,6 +41,8 @@ otelcol.receiver.otlp "default" {
 }
 
 otelcol.processor.encryption "gen_ai" {
+  signing_key = local.file.signing_key.content
+
   // Messages and system instructions: readable by the business review team.
   rule {
     name       = "messages"
@@ -48,6 +57,8 @@ otelcol.processor.encryption "gen_ai" {
       "gen_ai.prompt",
       "gen_ai.completion",
     ]
+    // Error messages often echo the prompt.
+    presets = ["exceptions"]
 
     log_body             = true
     log_body_event_names = [

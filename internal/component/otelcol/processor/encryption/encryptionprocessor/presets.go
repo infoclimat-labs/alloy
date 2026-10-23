@@ -47,4 +47,12 @@ var presets = map[string]preset{
 			`^retrieval\.documents\.\d+\.document\.content$`,
 		},
 	},
+	// Exception messages and stack traces, which often echo the prompt or
+	// the payload that caused the error.
+	"exceptions": {
+		attributes: []string{
+			"exception.message",
+			"exception.stacktrace",
+		},
+	},
 }

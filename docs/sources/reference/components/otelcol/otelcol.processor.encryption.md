@@ -40,9 +40,11 @@ otelcol.processor.encryption "<LABEL>" {
 
 You can use the following arguments with `otelcol.processor.encryption`:
 
-| Name       | Type     | Description                                         | Default    | Required |
-| ---------- | -------- | --------------------------------------------------- | ---------- | -------- |
-| `on_error` | `string` | What to do with a value that can't be encrypted.    | `"delete"` | no       |
+| Name                     | Type     | Description                                                                 | Default    | Required |
+| ------------------------ | -------- | --------------------------------------------------------------------------- | ---------- | -------- |
+| `accept_encrypted_input` | `bool`   | Keep values that another {{< param "PRODUCT_NAME" >}} instance already encrypted. | `false` | no       |
+| `on_error`               | `string` | What to do with a value that can't be encrypted.                            | `"delete"` | no       |
+| `signing_key`            | `secret` | PEM-encoded key used to sign every record that carries encrypted values.    | `""`       | no       |
 
 `on_error` accepts the following values:
 
@@ -50,6 +52,18 @@ You can use the following arguments with `otelcol.processor.encryption`:
 * `reject`: Fail the whole batch and return the error to the previous component.
 
 {{< param "PRODUCT_NAME" >}} never forwards a value in clear text when encryption fails.
+
+Encryption alone protects confidentiality, not authenticity: anyone who holds a recipient public key can produce values that decrypt.
+When you set `signing_key`, `otelcol.processor.encryption` signs each span or log record it encrypts.
+The signature covers the record ID, the trace and span IDs, the wrapped keys, and every encrypted value with its location.
+A decryptor that pins the matching verification key detects forged, moved, altered, or deleted values.
+Generate the key pair with `otelcrypt keygen -signing`.
+The supported algorithms are `Ed25519` (default, about 30 µs per record) and the post-quantum `ML-DSA-65` and `ML-DSA-87` (about 1 ms per record).
+
+By default, `otelcol.processor.encryption` doesn't trust encryption metadata in incoming data.
+It removes incoming `encryption.*` attributes and encrypts values that look like encrypted values like any other value, so a client can't smuggle clear text past the processor.
+Set `accept_encrypted_input` to `true` on a second {{< param "PRODUCT_NAME" >}} tier to keep the values that the first tier encrypted.
+Values are only kept when they're well-formed and their wrapped key is present on the same record.
 
 ## Blocks
 
@@ -95,14 +109,16 @@ When several rules match the same attribute, the first rule wins.
 | `presets`              | `list(string)`         | Well-known sets of attributes to encrypt.                                           | `[]`    | no       |
 
 Each rule must select values with at least one of `presets`, `attributes`, `attribute_patterns`, or `log_body`.
-The rule applies to span attributes, span event attributes, and log record attributes.
-Resource and instrumentation scope attributes are never encrypted.
+The rule applies to span attributes, span event attributes, span link attributes, and log record attributes.
+Resource and instrumentation scope attributes, span names, and span status messages are never encrypted.
+Make sure your instrumentation doesn't put content there.
 
 `presets` accepts the following values:
 
 * `gen_ai`: The content attributes of the OpenTelemetry generative AI semantic conventions:
   `gen_ai.input.messages`, `gen_ai.output.messages`, `gen_ai.system_instructions`, `gen_ai.tool.definitions`, `gen_ai.tool.call.arguments`, `gen_ai.tool.call.result`, `gen_ai.embeddings.input`, the deprecated `gen_ai.prompt` and `gen_ai.completion`, and indexed attributes that match `^gen_ai\.(prompt|completion)\.\d+\.`.
 * `openinference`: The content attributes of the OpenInference semantic conventions, such as `input.value`, `output.value`, `llm.input_messages.*`, and `llm.output_messages.*`.
+* `exceptions`: `exception.message` and `exception.stacktrace`, which often echo the prompt or payload that caused an error.
 
 `log_body_event_names` matches the `EventName` field of the log record, or the `event.name` attribute when the field is empty.
 When `log_body_event_names` is empty, `log_body` encrypts the body of every log record.
@@ -120,7 +136,7 @@ The `key_rotation` block configures how often `otelcol.processor.encryption` ren
 | `max_age`    | `duration` | Maximum lifetime of a data encryption key.                        | `"10m"`    | no       |
 | `max_values` | `number`   | Number of values encrypted with a data encryption key before it's renewed. | `16777216` | no |
 
-`max_values` can't exceed 2<sup>32</sup>.
+`max_values` can't exceed 2<sup>31</sup>.
 Shorter lifetimes reduce how much telemetry a data encryption key leaked from memory can expose.
 Each renewal costs one public-key operation per recipient, which takes well under a millisecond.
 
@@ -151,6 +167,7 @@ The following fields are exported and can be referenced by other components:
 * `otelcol_processor_encryption_values_encrypted_total` (counter): Number of attribute values and log bodies encrypted, by `rule`.
 * `otelcol_processor_encryption_plaintext_bytes_total` (counter): Number of plaintext bytes encrypted, by `rule`.
 * `otelcol_processor_encryption_failures_total` (counter): Number of values that couldn't be encrypted, by `rule`.
+* `otelcol_processor_encryption_records_signed_total` (counter): Number of records signed.
 
 ## How encryption works
 
@@ -161,20 +178,30 @@ Each selected value is then encrypted with AES-256-GCM and replaced with a strin
 enc:v1:<DATA_KEY_ID>:<BASE64URL_CIPHERTEXT>
 ```
 
-The wrapped data encryption key is attached to the same span or log record, in an attribute named `encryption.dek.<DATA_KEY_ID>`.
+`otelcol.processor.encryption` adds the following attributes to each span or log record that carries encrypted values:
+
+* `encryption.rid`: A random record ID.
+* `encryption.dek.<DATA_KEY_ID>`: The wrapped data encryption key.
+* `encryption.sig`: The record signature, when `signing_key` is set.
+
 Every span or log record therefore carries what its recipients need to decrypt it, and stays decryptable after sampling, batching, or export to any backend.
 
-Each ciphertext is bound to its location: the signal, whether the value is an attribute or a log body, the attribute key, and the trace and span IDs.
-A token copied to another attribute, span, or trace fails to decrypt.
-The attribute key is bound after replacing every character outside `[A-Za-z0-9_]` with `_`, so values stay decryptable after a backend such as Loki sanitizes attribute names.
+Each ciphertext is bound to its location: the signal, the record ID, the trace and span IDs, whether the value is an attribute, an event or link attribute, or a log body, the event or link position, and the attribute key.
+A value copied to another attribute, event, record, or trace fails to decrypt.
+The additional data binds the attribute key after replacing every character outside `[A-Za-z0-9_]` with `_`, so values stay decryptable after a backend such as Loki sanitizes attribute names.
+The exact key is also encrypted with the value and checked by the decryptor.
 
-Non-string values, such as maps and lists, are serialized as JSON before encryption.
-Decryption restores their original type.
-
-Values that are already encrypted are left unchanged, so you can run `otelcol.processor.encryption` at several stages of a pipeline.
+Non-string values, such as maps, lists, and byte arrays, are restored with their original type.
 
 The default key encapsulation mechanism, `MLKEM768-X25519`, combines a post-quantum and a classical algorithm.
 This protects telemetry that you retain for a long time against attackers who record it now and decrypt it later with a quantum computer.
+A wrapped key takes about 1.6 KB per recipient with `MLKEM768-X25519`, and about 130 bytes per recipient with `X25519`.
+
+{{< admonition type="warning" >}}
+Backends must store attribute values without truncating them, otherwise the values can't be decrypted.
+Tempo truncates attribute values to 2048 bytes by default.
+Set `max_attribute_bytes` to `0` in the Tempo distributor configuration, or to a value larger than your largest encrypted value.
+{{< /admonition >}}
 
 [RFC 9180]: https://www.rfc-editor.org/rfc/rfc9180
 
@@ -202,11 +229,14 @@ Decrypt a trace exported from Tempo, or a Loki query response:
 
 ```shell
 curl -s http://tempo:3200/api/traces/<TRACE_ID> \
-  | otelcrypt decrypt -key control.key -reason "<JUSTIFICATION>" -audit-log audit.jsonl
+  | otelcrypt decrypt -key control.key -reason "<JUSTIFICATION>" \
+      -verify-key alloy-signing.pub -require-signature
 ```
 
-`otelcrypt decrypt` requires a justification and can append an audit record with the user, the input digest, the keys used, and the number of decrypted values.
-It accepts OTLP JSON traces and logs, Tempo API responses, and Loki query responses.
+`otelcrypt decrypt` requires a justification and appends a record to a hash-chained audit trail, `otelcrypt-audit.jsonl` by default, before it releases any clear text.
+The record contains the user, the input digest, the keys used, the decrypted traces, and the number of decrypted values.
+Check the integrity of the trail with `otelcrypt audit-verify`.
+`otelcrypt decrypt` accepts OTLP JSON traces and logs, Tempo API responses, and Loki query responses.
 
 `otelcrypt inspect` lists the data encryption keys and recipients found in a document without decrypting it.
 
@@ -214,7 +244,7 @@ It accepts OTLP JSON traces and logs, Tempo API responses, and Loki query respon
 
 ### Encrypt generative AI content
 
-This example encrypts the prompts, completions, and tool payloads of generative AI traces and logs, and sends the result to Tempo and Loki.
+This example encrypts the prompts, completions, and tool payloads of generative AI traces and logs, signs each record, and sends the result to Tempo and Loki.
 Model names, token usage, and latencies stay in clear text.
 
 ```alloy
@@ -232,7 +262,14 @@ otelcol.receiver.otlp "default" {
   }
 }
 
+local.file "signing_key" {
+  filename  = "/etc/alloy/keys/alloy-signing.key"
+  is_secret = true
+}
+
 otelcol.processor.encryption "gen_ai" {
+  signing_key = local.file.signing_key.content
+
   rule {
     name       = "content"
     recipients = [local.file.control_key.content]

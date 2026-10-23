@@ -14,6 +14,7 @@ import (
 	"github.com/grafana/alloy/syntax"
 	"github.com/grafana/alloy/syntax/alloytypes"
 	otelcomponent "go.opentelemetry.io/collector/component"
+	"go.opentelemetry.io/collector/config/configopaque"
 	"go.opentelemetry.io/collector/pipeline"
 )
 
@@ -34,6 +35,12 @@ func init() {
 type Arguments struct {
 	// OnError selects what happens when a value can't be encrypted.
 	OnError string `alloy:"on_error,attr,optional"`
+
+	// SigningKey is an optional PEM encoded record signing key.
+	SigningKey alloytypes.Secret `alloy:"signing_key,attr,optional"`
+
+	// AcceptEncryptedInput keeps values already encrypted by another tier.
+	AcceptEncryptedInput bool `alloy:"accept_encrypted_input,attr,optional"`
 
 	// KeyRotation controls data encryption key rotation.
 	KeyRotation KeyRotationArguments `alloy:"key_rotation,block,optional"`
@@ -100,6 +107,8 @@ func (args *Arguments) Validate() error {
 func (args Arguments) Convert() (otelcomponent.Config, error) {
 	cfg := encryptionprocessor.NewFactory().CreateDefaultConfig().(*encryptionprocessor.Config)
 	cfg.OnError = encryptionprocessor.OnError(args.OnError)
+	cfg.SigningKey = configopaque.String(args.SigningKey)
+	cfg.AcceptEncryptedInput = args.AcceptEncryptedInput
 	cfg.KeyRotation = encryptionprocessor.KeyRotationConfig{
 		MaxValues: args.KeyRotation.MaxValues,
 		MaxAge:    args.KeyRotation.MaxAge,

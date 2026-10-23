@@ -40,8 +40,11 @@ shows what is visible without a key, then decrypts with each of the three keys:
 | `technical` | tool definitions, call arguments and results (rule `tools`) |
 | `escrow`    | everything (break-glass key, kept offline in real life)     |
 
-Every decryption requires a justification and appends a record to
-`audit/audit.jsonl`.
+Every record is signed by Alloy (Ed25519 key generated at first start) and
+`decrypt.sh` only decrypts records whose signature verifies against
+`alloy-signing.pub`. Every decryption requires a justification and appends a
+record to the hash-chained trail `audit/audit.jsonl`, checked at the end with
+`otelcrypt audit-verify`.
 
 Grafana runs on <http://localhost:3000>: open the Tempo data source and look at
 a trace of `agent-meteo`. Content attributes show `enc:v1:...` tokens, while
@@ -63,8 +66,12 @@ docker compose down -v
 | `Dockerfile`               | Builds the forked Alloy and the `otelcrypt` tool.                 |
 | `compose.yaml`             | Alloy, Tempo, Loki, Grafana, key generation, generator, toolbox.  |
 
-The demo generates keys in a Docker volume for convenience. Only the public
-keys volume is mounted into Alloy.
+The demo generates keys in Docker volumes for convenience. Alloy only mounts
+the recipients' public keys and its own signing key; the recipients' private
+keys live in a separate volume mounted by the toolbox only.
+
+`tempo.yaml` sets `max_attribute_bytes: 0`: Tempo truncates attribute values
+to 2048 bytes by default, which would corrupt ciphertexts and wrapped keys.
 
 ## Design
 
@@ -86,41 +93,63 @@ keys volume is mounted into Alloy.
   record (`encryption.dek.<id>`), so every record stays decryptable on its own
   after sampling, batching, retention or export, in any backend.
 * **Context binding.** The AEAD additional data binds each ciphertext to the
-  signal, the scope (span, span event, log, log body), the attribute key and
-  the trace and span IDs. Moving a token to another attribute or trace makes
-  it undecryptable. Keys are bound in their sanitized form (`[A-Za-z0-9_]`),
-  so values stay decryptable after Loki rewrites attribute names.
+  signal, a random per-record ID (`encryption.rid`), the trace and span IDs,
+  the scope (span, span event, span link, log, log body), the event or link
+  position and the attribute key. Moving a token to another attribute, event,
+  record or trace makes it undecryptable. Keys are bound in their sanitized
+  form (`[A-Za-z0-9_]`) so values stay decryptable after Loki rewrites
+  attribute names; the exact key is encrypted with the value and checked.
+* **Record signatures (optional, recommended).** Alloy signs each record
+  (Ed25519, or ML-DSA-65/87) over the record ID, IDs, wrapped keys and every
+  token with its location. With `-require-signature`, `otelcrypt` refuses
+  forged records, including ones built with a recipient public key, and
+  detects moved, altered or deleted values.
+* **Untrusted input.** Incoming `encryption.*` attributes are dropped and
+  token-looking values are encrypted like any other value, unless
+  `accept_encrypted_input` is set on a second Alloy tier.
 * **Header authentication.** The wrapped-key blob header (version, suite, key
   ID) is part of the HPKE `info`, so it can't be altered without detection.
-* **Typed values.** Maps, lists and numbers are serialized as JSON with a type
-  marker and restored with their original type.
+* **Typed values.** Maps, lists, numbers and byte arrays are restored with
+  their original type.
 
 ### Wire format
 
 ```text
-attribute value : enc:v1:<dek-id>:<base64url(nonce ‖ ciphertext ‖ tag)>
-record attribute: encryption.dek.<dek-id> = <blob>[.<blob>...]
+attribute value : enc:v1:<dek-id>:<base64url(nonce ‖ AES-256-GCM(plaintext, AAD))>
+plaintext       : kind ('s'|'j'|'b') ‖ uvarint(len(key)) ‖ key ‖ value
+AAD             : lp("otel-encryption/v1 value") ‖ lp(dek-id) ‖ lp(signal) ‖ lp(scope)
+                  ‖ lp(position) ‖ lp(normalized key) ‖ lp(rid) ‖ lp(trace-id) ‖ lp(span-id)
+record attrs    : encryption.rid = hex(16 random bytes)
+                  encryption.dek.<dek-id> = <blob>[.<blob>...]
+                  encryption.sig = <signing-key-id>.<base64url(signature)>   (optional)
 blob            : base64url("OE" ‖ 0x01 ‖ KEM ‖ KDF ‖ AEAD ‖ key-id[8] ‖ HPKE enc ‖ HPKE ciphertext)
 dek-id          : hex(SHA-256(record attribute value))[0:18]
 key-id          : hex(SHA-256("otel-encryption/v1 kid" ‖ suite ‖ public key))[0:16]
+signature       : Sign(SHA-256(canonical manifest: signal, rid, IDs, sorted entries
+                  (scope, position, normalized key, token), sorted wrapped keys))
 ```
 
 ### Threat model
 
-| Threat                                              | Mitigation                                                                 |
-| --------------------------------------------------- | -------------------------------------------------------------------------- |
-| Backend operators or users read prompts             | Content is encrypted before it leaves Alloy; backends only store tokens.   |
-| Compromise of the Alloy cluster                     | Alloy holds public keys only: past telemetry stays confidential. A live attacker can still read new traffic in memory, as with any in-line processor. |
-| Leak of a DEK from Alloy memory                     | Bounded by the rotation window (10 minutes / 2^24 values by default).      |
-| Tokens copied between records to forge evidence     | AEAD context binding to key, scope and trace/span IDs.                     |
-| "Harvest now, decrypt later" on long-term archives  | Post-quantum hybrid KEM by default.                                        |
-| Encryption failure leaks clear text                 | Fail-closed: `on_error = "delete"` (default) or `"reject"`.                 |
-| Unaccountable decryption                            | `otelcrypt decrypt` requires a reason and writes an audit trail.           |
-| One team reads another team's data                  | One rule per audience, each with its own recipients.                       |
+| Threat                                                   | Mitigation                                                                 |
+| -------------------------------------------------------- | -------------------------------------------------------------------------- |
+| Backend operators or users read prompts                  | Content is encrypted before it leaves Alloy; backends only store tokens.   |
+| Compromise of the Alloy cluster                          | Alloy holds public keys only: telemetry already stored stays confidential. A live attacker can read new traffic in memory and sign records with Alloy's key, as with any in-line processor. |
+| Leak of a DEK from Alloy memory                          | Bounded by the rotation window (10 minutes / 2^24 values by default; best effort, Go can't wipe memory). |
+| Forged records (anyone holding a recipient public key)   | Record signatures, verified with `-require-signature`. Without a signing key the scheme gives confidentiality only. |
+| Tokens moved, swapped or deleted to alter evidence       | AEAD binding to record ID, position, key and IDs; deletions detected by the signature. |
+| Client smuggles clear text with an `enc:v1:` prefix      | Incoming tokens and `encryption.*` attributes aren't trusted by default.   |
+| Encrypted `event.name` disables body encryption          | The body rule is resolved before attributes; unreadable names fail closed. |
+| "Harvest now, decrypt later" on long-term archives       | Post-quantum hybrid KEM by default; ML-DSA signatures available.           |
+| Encryption failure leaks clear text                      | Fail-closed: `on_error = "delete"` (default) or `"reject"`.                 |
+| Backend truncates long values                            | Detected (AEAD failure, with a hint); configure the backend (Tempo `max_attribute_bytes`). |
+| Unaccountable decryption                                 | Mandatory reason; hash-chained audit trail written before clear text is released; `audit-verify`. |
+| One team reads another team's data                       | One rule per audience, each with its own recipients; first matching rule wins. |
 
 Out of scope for this proof of concept: protecting the private keys (use an
-HSM or an offline vault), hiding metadata (span names, attribute keys, sizes
-and timing remain visible), searching inside encrypted content.
+HSM or an offline vault), a tamper-proof remote audit sink, hiding metadata
+(span names, resource attributes, attribute keys, value sizes and timing remain
+visible), and searching inside encrypted content.
 
 ### GDPR and AI Act notes
 
@@ -134,8 +163,10 @@ This is engineering guidance, not legal advice.
 
 ### Performance
 
-Measured on 2 vCPUs in a sandbox: a batch of 100 spans carrying two 4 KiB
-prompts each is encrypted in about 5 ms (≈170 MB/s of content per core,
-≈20 000 spans/s); sealing one value costs about 14 µs for 4 KiB.
+Measured on a GitHub-hosted runner (4 vCPU): a batch of 100 spans carrying two
+4 KiB prompts each is encrypted in about 2.5 ms (≈340 MB/s of content,
+≈40 000 spans/s on one core); sealing one 4 KiB value takes about 8 µs; a DEK
+rotation (post-quantum hybrid KEM) about 0.17 ms. Record signatures add about
+30 µs (Ed25519) or 1 ms (ML-DSA-65) per record.
 
 [RFC 9180]: https://www.rfc-editor.org/rfc/rfc9180

@@ -56,19 +56,27 @@ otelcrypt inspect -in "$OUT/trace-encrypted.json"
 
 echo
 echo "== Decryption by each authority"
+VERIFY="-verify-key /public/alloy-signing.pub -require-signature"
 for who in business technical escrow; do
   status=0
-  otelcrypt decrypt -key "/keys/$who.key" -in "$OUT/trace-encrypted.json" \
+  rm -f "$OUT/trace-$who.json"
+  # shellcheck disable=SC2086 # VERIFY holds several flags
+  otelcrypt decrypt -key "/keys/$who.key" $VERIFY -in "$OUT/trace-encrypted.json" \
     -out "$OUT/trace-$who.json" -reason "demo: review of trace $trace_id by $who" \
     -audit-log "$OUT/audit.jsonl" 2> "$OUT/decrypt-$who.log" || status=$?
   echo "-- $who: $(head -1 "$OUT/decrypt-$who.log") (exit $status)"
+  # Errors are expected for the values this key can't open; show the others.
+  grep -v 'no private key matches' "$OUT/decrypt-$who.log" | sed -n '2,4p'
+  [ -f "$OUT/trace-$who.json" ] || continue
   jq -r '[.. | objects | select(has("key") and (.key | startswith("gen_ai.")))
     | select(.key | test("messages|instructions|definitions|arguments|result"))
     | "   \(.key): \(.value.stringValue // .value | tostring | .[0:110])"] | unique | .[]' "$OUT/trace-$who.json"
 done
 if [ $CHECK -eq 1 ]; then
-  grep -q "$MARKER" "$OUT/trace-escrow.json" || fail "escrow key did not restore the content"
+  [ -f "$OUT/trace-escrow.json" ] || fail "escrow decryption failed: $(cat "$OUT/decrypt-escrow.log")"
+  grep -q "$MARKER" "$OUT/trace-escrow.json" || fail "escrow key did not restore the content: $(cat "$OUT/decrypt-escrow.log")"
   grep -q 'enc:v1:' "$OUT/trace-escrow.json" && fail "escrow key left encrypted values"
+  grep -q '"signatures_verified":0' "$OUT/audit.jsonl" && fail "records without a verified signature"
 fi
 
 echo
@@ -89,7 +97,9 @@ if grep -q "$MARKER" "$OUT/logs-encrypted.json"; then
   fail "clear text content found in Loki"
 fi
 echo "clear text marker absent from Loki: OK"
-otelcrypt decrypt -key /keys/escrow.key -in "$OUT/logs-encrypted.json" -out "$OUT/logs-escrow.json" \
+rm -f "$OUT/logs-escrow.json"
+# shellcheck disable=SC2086
+otelcrypt decrypt -key /keys/escrow.key $VERIFY -in "$OUT/logs-encrypted.json" -out "$OUT/logs-escrow.json" \
   -reason "demo: review of agent events" -audit-log "$OUT/audit.jsonl"
 jq -r '.data.result[].values[] | "   \(.[1] | .[0:120])"' "$OUT/logs-escrow.json" | head -8
 if [ $CHECK -eq 1 ]; then
@@ -98,6 +108,7 @@ fi
 
 echo
 echo "== Audit trail ($OUT/audit.jsonl)"
-jq -c '{time, user, reason, keys, decrypted, failed}' "$OUT/audit.jsonl" | tail -4
+jq -c '{time, user, reason, keys, decrypted, failed, signatures_verified}' "$OUT/audit.jsonl" | tail -4
+otelcrypt audit-verify -in "$OUT/audit.jsonl"
 echo
 echo "OK"

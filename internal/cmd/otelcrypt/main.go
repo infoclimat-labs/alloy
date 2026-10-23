@@ -1,16 +1,20 @@
 // Command otelcrypt manages the keys of the otelcol.processor.encryption
 // component and decrypts telemetry exported from a backend.
 //
-//	otelcrypt keygen  -private control.key -public control.pub [-kem MLKEM768-X25519]
-//	otelcrypt pubkey  -key control.key
-//	otelcrypt inspect -in trace.json
-//	otelcrypt decrypt -key control.key -reason "ticket 42" [-in trace.json] [-out clear.json] [-audit-log audit.jsonl]
+//	otelcrypt keygen        -private control.key -public control.pub [-kem MLKEM768-X25519]
+//	otelcrypt keygen        -signing -private alloy-signing.key -public alloy-signing.pub [-alg Ed25519]
+//	otelcrypt pubkey        -key control.key
+//	otelcrypt inspect       -in trace.json
+//	otelcrypt decrypt       -key control.key -reason "ticket 42" [-verify-key alloy-signing.pub -require-signature]
+//	otelcrypt audit-verify  -in otelcrypt-audit.jsonl
 //
 // Decryption is meant to run on a workstation that holds the private keys,
 // outside the telemetry pipeline. It only depends on the Go standard library.
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -20,6 +24,7 @@ import (
 	"io"
 	"os"
 	"os/user"
+	"path/filepath"
 	"slices"
 	"strings"
 	"time"
@@ -46,13 +51,16 @@ func (e exitError) Error() string { return fmt.Sprintf("exit status %d", int(e))
 const usage = `usage: otelcrypt <command> [flags]
 
 commands:
-  keygen    generate a recipient key pair
-  pubkey    print the public key of a private key
-  inspect   list the wrapped keys and recipients found in a document
-  decrypt   decrypt an exported OTLP JSON or Loki document
+  keygen        generate a recipient key pair, or a signing key pair with -signing
+  pubkey        print the public key of a private key
+  inspect       list the wrapped keys and recipients found in a document
+  decrypt       decrypt an exported OTLP JSON or Loki document
+  audit-verify  check the hash chain of an audit trail
 
 Run "otelcrypt <command> -h" for the flags of a command.
 `
+
+const defaultAuditLog = "otelcrypt-audit.jsonl"
 
 func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
@@ -68,6 +76,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 		return inspect(args[1:], stdin, stdout, stderr)
 	case "decrypt":
 		return decryptCmd(args[1:], stdin, stdout, stderr)
+	case "audit-verify":
+		return auditVerify(args[1:], stdout, stderr)
 	case "-h", "--help", "help":
 		_, _ = fmt.Fprint(stdout, usage)
 		return nil
@@ -88,6 +98,8 @@ func keygen(args []string, stdout, stderr io.Writer) error {
 	kem := fs.String("kem", "MLKEM768-X25519", "KEM: MLKEM768-X25519, MLKEM768-P256, MLKEM1024-P384, MLKEM768, MLKEM1024, X25519, P256")
 	kdf := fs.String("kdf", "HKDF-SHA256", "KDF: HKDF-SHA256, HKDF-SHA384, HKDF-SHA512")
 	aead := fs.String("aead", "AES-256-GCM", "AEAD: AES-256-GCM, AES-128-GCM, ChaCha20-Poly1305")
+	signing := fs.Bool("signing", false, "generate a record signing key pair instead of a recipient key pair")
+	alg := fs.String("alg", envelope.SigEd25519, "signature algorithm with -signing: Ed25519, ML-DSA-65, ML-DSA-87")
 	privPath := fs.String("private", "", "file to write the private key to (mode 0600, required)")
 	pubPath := fs.String("public", "", "file to write the public key to (default: stdout)")
 	if err := fs.Parse(args); err != nil {
@@ -96,22 +108,33 @@ func keygen(args []string, stdout, stderr io.Writer) error {
 	if *privPath == "" {
 		return errors.New("keygen: -private is required")
 	}
-	suite, err := envelope.ParseSuite(*kem, *kdf, *aead)
-	if err != nil {
-		return err
-	}
-	k, err := envelope.GenerateKey(suite)
-	if err != nil {
-		return err
-	}
-	privPEM, err := k.MarshalPEM()
-	if err != nil {
-		return err
+
+	var privPEM, pubPEM []byte
+	var desc, kid string
+	if *signing {
+		k, err := envelope.GenerateSigningKey(*alg)
+		if err != nil {
+			return err
+		}
+		privPEM, pubPEM, desc, kid = k.MarshalPEM(), k.Public().MarshalPEM(), k.Public().Algorithm()+" signing", k.KeyID()
+	} else {
+		suite, err := envelope.ParseSuite(*kem, *kdf, *aead)
+		if err != nil {
+			return err
+		}
+		k, err := envelope.GenerateKey(suite)
+		if err != nil {
+			return err
+		}
+		if privPEM, err = k.MarshalPEM(); err != nil {
+			return err
+		}
+		pubPEM, desc, kid = k.Public().MarshalPEM(), suite.String(), k.KeyID()
 	}
 	if err := writeNew(*privPath, privPEM, 0o600); err != nil {
 		return err
 	}
-	pubPEM := k.Public().MarshalPEM()
+	var err error
 	if *pubPath == "" {
 		_, err = stdout.Write(pubPEM)
 	} else {
@@ -120,12 +143,12 @@ func keygen(args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	_, _ = fmt.Fprintf(stderr, "generated %s key %s\n", suite, k.KeyID())
+	_, _ = fmt.Fprintf(stderr, "generated %s key %s\n", desc, kid)
 	return nil
 }
 
-// writeNew refuses to overwrite an existing file, so a key is never lost by
-// mistake.
+// writeNew refuses to overwrite or follow an existing file, so a key or a
+// clear text export never lands somewhere unexpected.
 func writeNew(path string, data []byte, mode os.FileMode) error {
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
 	if err != nil {
@@ -140,16 +163,24 @@ func writeNew(path string, data []byte, mode os.FileMode) error {
 
 func pubkey(args []string, stdout, stderr io.Writer) error {
 	fs := newFlagSet("pubkey", stderr)
-	keyPath := fs.String("key", "", "private key file (required)")
+	keyPath := fs.String("key", "", "private key file, recipient or signing (required)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if *keyPath == "" {
 		return errors.New("pubkey: -key is required")
 	}
-	k, err := loadPrivateKey(*keyPath)
+	data, err := os.ReadFile(*keyPath)
 	if err != nil {
 		return err
+	}
+	if sk, err := envelope.ParseSigningKey(data); err == nil {
+		_, err = stdout.Write(sk.Public().MarshalPEM())
+		return err
+	}
+	k, err := envelope.ParsePrivateKey(data)
+	if err != nil {
+		return fmt.Errorf("%s: %w", *keyPath, err)
 	}
 	_, err = stdout.Write(k.Public().MarshalPEM())
 	return err
@@ -167,25 +198,54 @@ func loadPrivateKey(path string) (*envelope.PrivateKey, error) {
 	return k, nil
 }
 
+func loadVerifyKey(path string) (*envelope.VerifyKey, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	k, err := envelope.ParseVerifyKey(data)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	return k, nil
+}
+
 type stringList []string
 
 func (s *stringList) String() string     { return strings.Join(*s, ",") }
 func (s *stringList) Set(v string) error { *s = append(*s, v); return nil }
 
-func readInput(path string, stdin io.Reader) ([]byte, error) {
-	if path == "" || path == "-" {
-		return io.ReadAll(stdin)
+// readInput reads at most maxSize bytes.
+func readInput(path string, stdin io.Reader, maxSize int64) ([]byte, error) {
+	r := stdin
+	if path != "" && path != "-" {
+		f, err := os.Open(path)
+		if err != nil {
+			return nil, err
+		}
+		defer f.Close()
+		r = f
 	}
-	return os.ReadFile(path)
+	data, err := io.ReadAll(io.LimitReader(r, maxSize+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > maxSize {
+		return nil, fmt.Errorf("input larger than %d bytes, raise -max-size if expected", maxSize)
+	}
+	return data, nil
 }
+
+const defaultMaxSize = 256 << 20
 
 func inspect(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	fs := newFlagSet("inspect", stderr)
 	in := fs.String("in", "-", "input document")
+	maxSize := fs.Int64("max-size", defaultMaxSize, "maximum input size in bytes")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	doc, err := readInput(*in, stdin)
+	doc, err := readInput(*in, stdin, *maxSize)
 	if err != nil {
 		return err
 	}
@@ -199,27 +259,40 @@ func inspect(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 }
 
 type auditRecord struct {
-	Time        time.Time `json:"time"`
-	User        string    `json:"user"`
-	Host        string    `json:"host"`
-	Reason      string    `json:"reason"`
-	Input       string    `json:"input"`
-	InputSHA256 string    `json:"input_sha256"`
-	Keys        []string  `json:"keys"`
-	Format      string    `json:"format"`
-	Decrypted   int       `json:"decrypted"`
-	Failed      int       `json:"failed"`
+	Time          time.Time `json:"time"`
+	User          string    `json:"user"`
+	Host          string    `json:"host"`
+	Reason        string    `json:"reason"`
+	Input         string    `json:"input"`
+	InputSHA256   string    `json:"input_sha256"`
+	Keys          []string  `json:"keys"`
+	VerifyKeys    []string  `json:"verify_keys,omitempty"`
+	Format        string    `json:"format"`
+	Records       int       `json:"records"`
+	Decrypted     int       `json:"decrypted"`
+	Failed        int       `json:"failed"`
+	Verified      int       `json:"signatures_verified"`
+	Unsigned      int       `json:"unsigned_records"`
+	Invalid       int       `json:"invalid_signatures"`
+	TraceIDs      []string  `json:"trace_ids,omitempty"`
+	OutputWritten bool      `json:"output_written"`
+	// Prev is the SHA-256 of the previous line of the trail, which makes
+	// edits and deletions detectable with audit-verify.
+	Prev string `json:"prev"`
 }
 
 func decryptCmd(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	fs := newFlagSet("decrypt", stderr)
-	var keyPaths stringList
+	var keyPaths, verifyPaths stringList
 	fs.Var(&keyPaths, "key", "private key file (repeatable)")
+	fs.Var(&verifyPaths, "verify-key", "verification key of the signing Alloy instances (repeatable)")
+	requireSig := fs.Bool("require-signature", false, "only decrypt records with a valid signature from a -verify-key")
 	in := fs.String("in", "-", "input document (OTLP JSON traces or logs, Tempo API response, Loki query response)")
-	out := fs.String("out", "-", "output file")
+	out := fs.String("out", "-", "output file, created with mode 0600; must not exist")
 	reason := fs.String("reason", "", "justification recorded in the audit trail (required)")
-	auditLog := fs.String("audit-log", "", "append a JSON audit record to this file")
-	keep := fs.Bool("keep-key-attributes", false, "keep the encryption.dek.* attributes in the output")
+	auditLog := fs.String("audit-log", defaultAuditLog, "audit trail file (JSON lines, hash chained)")
+	keep := fs.Bool("keep-key-attributes", false, "keep the encryption.* attributes in the output")
+	maxSize := fs.Int64("max-size", defaultMaxSize, "maximum input size in bytes")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -228,6 +301,12 @@ func decryptCmd(args []string, stdin io.Reader, stdout, stderr io.Writer) error 
 	}
 	if strings.TrimSpace(*reason) == "" {
 		return errors.New("decrypt: -reason is required: decryption must be justified")
+	}
+	if *auditLog == "" {
+		return errors.New("decrypt: -audit-log can't be empty: every decryption is audited")
+	}
+	if *requireSig && len(verifyPaths) == 0 {
+		return errors.New("decrypt: -require-signature needs at least one -verify-key")
 	}
 
 	var keys []*envelope.PrivateKey
@@ -238,56 +317,108 @@ func decryptCmd(args []string, stdin io.Reader, stdout, stderr io.Writer) error 
 		}
 		keys = append(keys, k)
 	}
+	var vkeys []*envelope.VerifyKey
+	var vkids []string
+	for _, p := range verifyPaths {
+		k, err := loadVerifyKey(p)
+		if err != nil {
+			return err
+		}
+		vkeys = append(vkeys, k)
+		vkids = append(vkids, k.KeyID())
+	}
 	kr := envelope.NewKeyring(keys...)
 
-	doc, err := readInput(*in, stdin)
+	doc, err := readInput(*in, stdin, *maxSize)
 	if err != nil {
 		return err
 	}
-	clear, rep, err := decrypt.New(kr, decrypt.Options{KeepKeyAttributes: *keep}).Decrypt(doc)
+	opts := decrypt.Options{KeepKeyAttributes: *keep, RequireSignature: *requireSig}
+	if len(vkeys) > 0 {
+		opts.Verifier = envelope.NewVerifier(vkeys...)
+	}
+	clear, rep, err := decrypt.New(kr, opts).Decrypt(doc)
 	if err != nil {
 		return err
 	}
 
+	// The audit record is written before any clear text is released.
 	sum := sha256.Sum256(doc)
 	rec := auditRecord{
-		Time:        time.Now().UTC(),
-		User:        currentUser(),
-		Host:        hostname(),
-		Reason:      *reason,
-		Input:       *in,
-		InputSHA256: hex.EncodeToString(sum[:]),
-		Keys:        slices.Sorted(slices.Values(kr.KeyIDs())),
-		Format:      rep.Format,
-		Decrypted:   rep.Decrypted,
-		Failed:      rep.Failed,
+		Time:          time.Now().UTC(),
+		User:          currentUser(),
+		Host:          hostname(),
+		Reason:        *reason,
+		Input:         *in,
+		InputSHA256:   hex.EncodeToString(sum[:]),
+		Keys:          slices.Sorted(slices.Values(kr.KeyIDs())),
+		VerifyKeys:    vkids,
+		Format:        rep.Format,
+		Records:       rep.Records,
+		Decrypted:     rep.Decrypted,
+		Failed:        rep.Failed,
+		Verified:      rep.Verified,
+		Unsigned:      rep.Unsigned,
+		Invalid:       rep.Invalid,
+		TraceIDs:      rep.TraceIDs,
+		OutputWritten: rep.Decrypted > 0,
 	}
-	if *auditLog != "" {
-		if err := appendAudit(*auditLog, rec); err != nil {
-			return fmt.Errorf("writing audit record (output withheld): %w", err)
-		}
+	if err := appendAudit(*auditLog, rec); err != nil {
+		return fmt.Errorf("writing audit record (output withheld): %w", err)
 	}
 
 	if *out == "" || *out == "-" {
 		_, err = stdout.Write(clear)
 	} else {
-		err = os.WriteFile(*out, clear, 0o600)
+		err = writeNew(*out, clear, 0o600)
 	}
 	if err != nil {
 		return err
 	}
 
-	_, _ = fmt.Fprintf(stderr, "decrypted %d value(s), %d failure(s) [%s]\n", rep.Decrypted, rep.Failed, rep.Format)
+	_, _ = fmt.Fprintf(stderr, "decrypted %d value(s) in %d record(s), %d failure(s) [%s]", rep.Decrypted, rep.Records, rep.Failed, rep.Format)
+	if opts.Verifier != nil {
+		_, _ = fmt.Fprintf(stderr, "; signatures: %d verified, %d unsigned, %d invalid", rep.Verified, rep.Unsigned, rep.Invalid)
+	}
+	_, _ = fmt.Fprintln(stderr)
 	for _, e := range rep.Errors {
 		_, _ = fmt.Fprintln(stderr, "  -", e)
 	}
-	if rep.Failed > 0 {
+	if rep.Failed > 0 || rep.Invalid > 0 {
 		return exitError(3)
 	}
 	return nil
 }
 
+// lastLineHash returns the SHA-256 of the last line of the trail.
+func lastLineHash(path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	data = bytes.TrimRight(data, "\n")
+	if len(data) == 0 {
+		return "", nil
+	}
+	last := data[bytes.LastIndexByte(data, '\n')+1:]
+	sum := sha256.Sum256(last)
+	return hex.EncodeToString(sum[:]), nil
+}
+
 func appendAudit(path string, rec auditRecord) error {
+	if dir := filepath.Dir(path); dir != "" {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return err
+		}
+	}
+	prev, err := lastLineHash(path)
+	if err != nil {
+		return err
+	}
+	rec.Prev = prev
 	line, err := json.Marshal(rec)
 	if err != nil {
 		return err
@@ -300,7 +431,45 @@ func appendAudit(path string, rec auditRecord) error {
 		f.Close()
 		return err
 	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
 	return f.Close()
+}
+
+func auditVerify(args []string, stdout, stderr io.Writer) error {
+	fs := newFlagSet("audit-verify", stderr)
+	in := fs.String("in", defaultAuditLog, "audit trail file")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	f, err := os.Open(*in)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64<<10), 16<<20)
+	prev, n := "", 0
+	for sc.Scan() {
+		line := sc.Bytes()
+		n++
+		var rec auditRecord
+		if err := json.Unmarshal(line, &rec); err != nil {
+			return fmt.Errorf("line %d: %w", n, err)
+		}
+		if rec.Prev != prev {
+			return fmt.Errorf("line %d: hash chain broken: the trail was edited or truncated before this line", n)
+		}
+		sum := sha256.Sum256(line)
+		prev = hex.EncodeToString(sum[:])
+	}
+	if err := sc.Err(); err != nil {
+		return err
+	}
+	_, _ = fmt.Fprintf(stdout, "%d record(s), hash chain intact, head %s\n", n, prev)
+	return nil
 }
 
 func currentUser() string {
