@@ -119,6 +119,7 @@ body:
       - otelcol.processor.cumulativetodelta
       - otelcol.processor.deltatocumulative
       - otelcol.processor.discovery
+      - otelcol.processor.encryption
       - otelcol.processor.filter
       - otelcol.processor.groupbyattrs
       - otelcol.processor.interval
