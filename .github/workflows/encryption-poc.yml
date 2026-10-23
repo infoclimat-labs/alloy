@@ -1,0 +1,271 @@
+# CI of the otelcol.processor.encryption proof of concept (fork only).
+#
+# Results are also reported as check-run annotations so they can be read
+# through the checks API.
+name: Encryption POC
+
+on:
+  push:
+    branches:
+      - feat/otelcol-processor-encryption
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: encryption-poc-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PKGS: ./internal/component/otelcol/processor/encryption/... ./internal/cmd/otelcrypt/...
+
+jobs:
+  test:
+    name: Unit tests, checks and benchmarks
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libsystemd-dev
+
+      - name: Vet
+        run: go vet -tags nodocker $PKGS
+
+      - name: Unit tests
+        run: |
+          set -o pipefail
+          go test -race -count=1 -tags nodocker $PKGS 2>&1 | tee test.log
+        continue-on-error: true
+        id: unit
+
+      - name: Component registry and generated docs
+        run: |
+          set -o pipefail
+          {
+            go test -count=1 -tags nodocker -run 'TestSetDefault_NoPointerReuse' ./internal/component/all/
+            go test -count=1 -tags nodocker -run 'TestLinksToTypesSectionsUpdated|TestCompatibleComponentsPageUpdated' ./internal/tools/docs_generator/
+          } 2>&1 | tee checks.log
+        continue-on-error: true
+        id: checks
+
+      - name: Collector distribution in sync
+        run: |
+          set -o pipefail
+          make generate-otel-collector-distro 2>&1 | tail -20
+          git diff --exit-code 2>&1 | tee distro.log
+        continue-on-error: true
+        id: distro
+
+      - name: Benchmarks
+        run: |
+          set -o pipefail
+          go test -run '^$' -bench . -benchtime 3s -benchmem \
+            ./internal/component/otelcol/processor/encryption/encryptionprocessor/... 2>&1 | tee bench.log
+        continue-on-error: true
+        id: bench
+
+      - name: Fuzz the token and wrapped-key parsers
+        run: |
+          go test -run '^$' -fuzz FuzzOpen -fuzztime 60s \
+            ./internal/component/otelcol/processor/encryption/encryptionprocessor/envelope/ 2>&1 | tail -20 | tee fuzz.log
+        continue-on-error: true
+        id: fuzz
+
+      - name: Build Alloy
+        run: |
+          set -o pipefail
+          cd collector && go build -o ../build/alloy . 2>&1 | tee ../build.log
+          ../build/alloy --version
+        continue-on-error: true
+        id: build
+
+      - name: Report
+        if: always()
+        env:
+          STEPS: ${{ toJSON(steps) }}
+        run: |
+          annotate() { # level title file
+            [ -f "$3" ] || return 0
+            msg=$(tail -c 60000 "$3" | sed ':a;N;$!ba;s/%/%25/g;s/\r/%0D/g;s/\n/%0A/g')
+            echo "::$1 title=$2::$msg"
+          }
+          rc=0
+          for s in unit:test.log checks:checks.log distro:distro.log fuzz:fuzz.log build:build.log; do
+            step=${s%%:*}; log=${s#*:}
+            outcome=$(jq -r --arg s "$step" '.[$s].outcome' <<< "$STEPS")
+            if [ "$outcome" = "success" ]; then
+              annotate notice "$step: passed" "$log"
+            else
+              annotate error "$step: $outcome" "$log"; rc=1
+            fi
+          done
+          grep -E '^(Benchmark|ok|FAIL)' bench.log > bench.txt || true
+          annotate notice "benchmarks" bench.txt
+          exit $rc
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Setup tools
+        uses: jdx/mise-action@dba19683ed58901619b14f395a24841710cb4925 # v4.1.0
+        with:
+          version: v2026.5.18
+          sha256: cfac593469d028d7ae5fe36e37bd7c59118b5238e92d8a876209578464f24a84
+          install_args: go task golangci-lint shellcheck
+
+      # The full-repository lint needs a larger runner than ubuntu-latest:
+      # lint the packages of this proof of concept with the repository config.
+      - name: Lint Go
+        run: |
+          set -o pipefail
+          mise exec -- golangci-lint run --timeout 30m --build-tags nodocker \
+            ./internal/component/otelcol/processor/encryption/... ./internal/cmd/otelcrypt/... 2>&1 | tee lint.log
+        id: lint
+        continue-on-error: true
+
+      - name: Alloy lint
+        run: |
+          set -o pipefail
+          task lint:alloylint 2>&1 | tee alloylint.log
+        id: alloylint
+        continue-on-error: true
+
+      - name: Shellcheck the demo
+        run: |
+          set -o pipefail
+          shellcheck example/encryption/decrypt.sh 2>&1 | tee shellcheck.log
+        id: shellcheck
+        continue-on-error: true
+
+      - name: Report
+        if: always()
+        env:
+          STEPS: ${{ toJSON(steps) }}
+        run: |
+          rc=0
+          for s in lint:lint.log alloylint:alloylint.log shellcheck:shellcheck.log; do
+            step=${s%%:*}; log=${s#*:}
+            outcome=$(jq -r --arg s "$step" '.[$s].outcome' <<< "$STEPS")
+            msg=$(tail -c 60000 "$log" 2>/dev/null | sed ':a;N;$!ba;s/%/%25/g;s/\r/%0D/g;s/\n/%0A/g')
+            if [ "$outcome" = "success" ]; then
+              echo "::notice title=$step: passed::${msg:-ok}"
+            else
+              echo "::error title=$step: $outcome::${msg:-see logs}"; rc=1
+            fi
+          done
+          exit $rc
+
+  e2e:
+    name: End-to-end demo (Alloy, Tempo, Loki)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: example/encryption
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Build images
+        run: |
+          set -o pipefail
+          docker compose build 2>&1 | tail -40
+
+      - name: Start the stack
+        run: |
+          ITERATIONS=3 INTERVAL=2 docker compose up -d
+          for i in $(seq 1 60); do
+            [ "$(docker compose ps --format json generator | jq -r '.State' 2>/dev/null)" = "exited" ] && break
+            sleep 5
+          done
+          docker compose logs generator | tail -10
+
+      - name: Check encryption at rest and decryption
+        run: |
+          set -o pipefail
+          docker compose run --rm -T toolbox /demo/decrypt.sh --check 2>&1 | tee e2e.log
+
+      - name: Report
+        if: always()
+        run: |
+          esc() { tail -c 30000 | sed ':a;N;$!ba;s/%/%25/g;s/\r/%0D/g;s/\n/%0A/g'; }
+          if [ -f e2e.log ] && grep -q '^OK$' e2e.log; then
+            echo "::notice title=e2e: passed::$(esc < e2e.log)"
+          else
+            echo "::error title=e2e: failed::$( (cat e2e.log 2>/dev/null; docker compose ps -a; docker compose logs --tail 60 alloy keys tempo loki generator) 2>&1 | esc)"
+            exit 1
+          fi
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v
+
+  publish:
+    name: Publish images to GHCR
+    needs: [test, e2e]
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+    env:
+      ALLOY_IMAGE: ghcr.io/${{ github.repository_owner }}/alloy
+      OTELCRYPT_IMAGE: ghcr.io/${{ github.repository_owner }}/otelcrypt
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-qemu-action@06116385d9baf250c9f4dcb4858b16962ea869c3 # v4.1.0
+
+      - uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      # The repository Dockerfile: same image as the official one (web UI,
+      # non-root user available, /bin/alloy entrypoint), with this fork's code.
+      - name: Build and push Alloy
+        run: |
+          set -o pipefail
+          short=$(git rev-parse --short HEAD)
+          docker buildx build --push --platform linux/amd64,linux/arm64 \
+            --build-arg VERSION="v0.0.0-encryption-poc-$short" --build-arg RELEASE_BUILD=0 \
+            -t "$ALLOY_IMAGE:encryption-poc" -t "$ALLOY_IMAGE:encryption-poc-$short" \
+            -f Dockerfile . 2>&1 | tail -40
+
+      - name: Build and push otelcrypt
+        run: |
+          set -o pipefail
+          short=$(git rev-parse --short HEAD)
+          docker buildx build --push --platform linux/amd64,linux/arm64 --target otelcrypt \
+            -t "$OTELCRYPT_IMAGE:encryption-poc" -t "$OTELCRYPT_IMAGE:encryption-poc-$short" \
+            -f example/encryption/Dockerfile . 2>&1 | tail -20
+
+      - name: Report
+        if: always()
+        run: |
+          short=$(git rev-parse --short HEAD)
+          if [ "${{ job.status }}" = "success" ]; then
+            echo "::notice title=publish: passed::$ALLOY_IMAGE:encryption-poc-$short and $OTELCRYPT_IMAGE:encryption-poc-$short pushed"
+          else
+            echo "::error title=publish: failed::see the job logs"
+          fi

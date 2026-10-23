@@ -101,6 +101,7 @@ import (
 	_ "github.com/grafana/alloy/internal/component/otelcol/processor/cumulativetodelta"      // Import otelcol.processor.cumulativetodelta
 	_ "github.com/grafana/alloy/internal/component/otelcol/processor/deltatocumulative"      // Import otelcol.processor.deltatocumulative
 	_ "github.com/grafana/alloy/internal/component/otelcol/processor/discovery"              // Import otelcol.processor.discovery
+	_ "github.com/grafana/alloy/internal/component/otelcol/processor/encryption"             // Import otelcol.processor.encryption
 	_ "github.com/grafana/alloy/internal/component/otelcol/processor/filter"                 // Import otelcol.processor.filter
 	_ "github.com/grafana/alloy/internal/component/otelcol/processor/groupbyattrs"           // Import otelcol.processor.groupbyattrs
 	_ "github.com/grafana/alloy/internal/component/otelcol/processor/interval"               // Import otelcol.processor.interval

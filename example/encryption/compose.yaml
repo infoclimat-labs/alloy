@@ -1,0 +1,114 @@
+# Demo of otelcol.processor.encryption.
+#
+#   docker compose up -d --build
+#   docker compose run --rm toolbox /demo/decrypt.sh
+#
+# See README.md.
+name: alloy-encryption-demo
+
+services:
+  # Generates the three recipient key pairs on first start. In production the
+  # private keys never live next to the pipeline: only the *.pub files are
+  # distributed to Alloy.
+  keys:
+    build:
+      context: ../..
+      dockerfile: example/encryption/Dockerfile
+      target: otelcrypt
+    image: alloy-encryption-demo/otelcrypt
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        for k in business technical escrow; do
+          [ -f "/private/$$k.key" ] || otelcrypt keygen -private "/private/$$k.key" -public "/public/$$k.pub"
+        done
+        # Alloy's record signing key: only Alloy holds the private half,
+        # auditors pin the public half.
+        [ -f /alloy-secrets/signing.key ] || otelcrypt keygen -signing -private /alloy-secrets/signing.key -public /public/alloy-signing.pub
+        chmod 0644 /public/*.pub
+        chmod 0600 /alloy-secrets/signing.key
+    volumes:
+      - private-keys:/private
+      - public-keys:/public
+      - alloy-secrets:/alloy-secrets
+
+  alloy:
+    build:
+      context: ../..
+      dockerfile: example/encryption/Dockerfile
+      target: alloy
+    image: alloy-encryption-demo/alloy
+    depends_on:
+      keys:
+        condition: service_completed_successfully
+      tempo:
+        condition: service_started
+      loki:
+        condition: service_started
+    ports:
+      - "12345:12345"
+      - "4317:4317"
+      - "4318:4318"
+    volumes:
+      - ./config.alloy:/etc/alloy/config.alloy:ro
+      # Only the public keys, and Alloy's own signing key, are mounted into
+      # Alloy: it can encrypt and sign, never decrypt.
+      - public-keys:/keys:ro
+      - alloy-secrets:/secrets:ro
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:12345/-/ready"]
+      interval: 5s
+      retries: 30
+
+  tempo:
+    image: grafana/tempo:2.8.2
+    command: ["-config.file=/etc/tempo.yaml"]
+    volumes:
+      - ./tempo.yaml:/etc/tempo.yaml:ro
+    ports:
+      - "3200:3200"
+
+  loki:
+    image: grafana/loki:3.5.5
+    command: ["-config.file=/etc/loki/local-config.yaml"]
+    ports:
+      - "3100:3100"
+
+  grafana:
+    image: grafana/grafana:12.2.0
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+    volumes:
+      - ./grafana-datasources.yaml:/etc/grafana/provisioning/datasources/datasources.yaml:ro
+    ports:
+      - "3000:3000"
+
+  # An agentic application instrumented with the OpenTelemetry Python SDK.
+  generator:
+    build: ./generator
+    image: alloy-encryption-demo/generator
+    depends_on:
+      alloy:
+        condition: service_healthy
+    environment:
+      ITERATIONS: ${ITERATIONS:-0}
+      INTERVAL: ${INTERVAL:-10}
+
+  # Workstation of the control authority: holds the private keys.
+  toolbox:
+    image: alloy-encryption-demo/otelcrypt
+    profiles: ["tools"]
+    entrypoint: ["/bin/sh"]
+    volumes:
+      - private-keys:/keys:ro
+      - public-keys:/public:ro
+      - ./decrypt.sh:/demo/decrypt.sh:ro
+      - ./audit:/audit
+
+volumes:
+  private-keys:
+  public-keys:
+  alloy-secrets:

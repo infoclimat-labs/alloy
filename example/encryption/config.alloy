@@ -1,0 +1,119 @@
+// Receives OTLP from agentic applications, encrypts generative AI content
+// and forwards traces to Tempo and logs to Loki.
+
+logging {
+  level = "info"
+}
+
+// Public keys only: this Alloy instance can encrypt but never decrypt.
+local.file "business_key" {
+  filename = "/keys/business.pub"
+}
+
+local.file "technical_key" {
+  filename = "/keys/technical.pub"
+}
+
+local.file "escrow_key" {
+  filename = "/keys/escrow.pub"
+}
+
+// Alloy signs every record it encrypts, so auditors can detect forged,
+// moved or deleted values.
+local.file "signing_key" {
+  filename  = "/secrets/signing.key"
+  is_secret = true
+}
+
+otelcol.receiver.otlp "default" {
+  grpc {
+    endpoint = "0.0.0.0:4317"
+  }
+
+  http {
+    endpoint = "0.0.0.0:4318"
+  }
+
+  output {
+    logs   = [otelcol.processor.encryption.gen_ai.input]
+    traces = [otelcol.processor.encryption.gen_ai.input]
+  }
+}
+
+otelcol.processor.encryption "gen_ai" {
+  signing_key = local.file.signing_key.content
+
+  // Messages and system instructions: readable by the business review team.
+  rule {
+    name       = "messages"
+    recipients = [
+      local.file.business_key.content,
+      local.file.escrow_key.content,
+    ]
+    attributes = [
+      "gen_ai.input.messages",
+      "gen_ai.output.messages",
+      "gen_ai.system_instructions",
+      "gen_ai.prompt",
+      "gen_ai.completion",
+    ]
+    // Error messages often echo the prompt.
+    presets = ["exceptions"]
+
+    log_body             = true
+    log_body_event_names = [
+      "gen_ai.system.message",
+      "gen_ai.user.message",
+      "gen_ai.assistant.message",
+      "gen_ai.choice",
+    ]
+  }
+
+  // Tool definitions, arguments and results: readable by the technical team.
+  // Tool names and call IDs stay in clear text.
+  rule {
+    name       = "tools"
+    recipients = [
+      local.file.technical_key.content,
+      local.file.escrow_key.content,
+    ]
+    attributes = [
+      "gen_ai.tool.definitions",
+      "gen_ai.tool.call.arguments",
+      "gen_ai.tool.call.result",
+    ]
+
+    log_body             = true
+    log_body_event_names = ["gen_ai.tool.message"]
+  }
+
+  output {
+    logs   = [otelcol.processor.batch.default.input]
+    traces = [otelcol.processor.batch.default.input]
+  }
+}
+
+otelcol.processor.batch "default" {
+  timeout = "2s"
+
+  output {
+    logs   = [otelcol.exporter.otlphttp.loki.input]
+    traces = [otelcol.exporter.otlp.tempo.input]
+  }
+}
+
+otelcol.exporter.otlp "tempo" {
+  client {
+    endpoint = "tempo:4317"
+
+    tls {
+      insecure = true
+    }
+  }
+}
+
+otelcol.exporter.otlphttp "loki" {
+  client {
+    endpoint = "http://loki:3100/otlp"
+  }
+}
